@@ -1,7 +1,7 @@
 /**
- * GeminiSTL - 2D Image to Watertight 3D STL Mesh Generator
- * Features exact Euclidean Distance Transform (EDT), Gaussian smoothing,
- * connected component noise filtering, Three.js 3D viewport, and binary STL export.
+ * GeminiSTL - High-Precision Watertight 3D STL Mesh Generator
+ * Features chromatic background rejection, smart reflection sealing,
+ * organic pillowed bevel sculpting (zero detail loss), and Three.js 3D viewport.
  */
 
 // --- Euclidean Distance Transform (Felzenszwalb & Huttenlocher 1D/2D) ---
@@ -34,7 +34,6 @@ function dt1d(f, n) {
   return d;
 }
 
-// Compute Euclidean distance from mask foreground pixels to the nearest background pixel (0)
 function distanceTransform(mask, w, h) {
   const INF = 1e9;
   let f = new Float32Array(w * h);
@@ -53,24 +52,17 @@ function distanceTransform(mask, w, h) {
   // Row pass
   const rowIn = new Float32Array(w);
   const dist = new Float32Array(w * h);
-  let maxD = 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) rowIn[x] = f[y * w + x];
     const rowOut = dt1d(rowIn, w);
     for (let x = 0; x < w; x++) {
-      const d = Math.sqrt(rowOut[x]);
-      dist[y * w + x] = d;
-      if (d > maxD) maxD = d;
+      dist[y * w + x] = Math.sqrt(rowOut[x]);
     }
-  }
-
-  if (maxD > 0) {
-    for (let i = 0; i < w * h; i++) dist[i] /= maxD;
   }
   return dist;
 }
 
-// Separable 1D Gaussian filter
+// Separable Gaussian filter
 function gaussianFilter(arr, w, h, sigma) {
   if (sigma <= 0) return arr.slice();
   const radius = Math.ceil(sigma * 3);
@@ -111,44 +103,51 @@ function gaussianFilter(arr, w, h, sigma) {
   return out;
 }
 
-// Morphological closing (dilation followed by erosion) to seal internal crevices
-function binaryClosing(mask, w, h) {
-  const dilated = new Uint8Array(w * h);
-  for (let y = 0; y < h; y++) {
-    const row = y * w;
-    for (let x = 0; x < w; x++) {
-      const idx = row + x;
-      if (mask[idx]) {
-        dilated[idx] = 1;
-        if (x > 0) dilated[idx - 1] = 1;
-        if (x < w - 1) dilated[idx + 1] = 1;
-        if (y > 0) dilated[idx - w] = 1;
-        if (y < h - 1) dilated[idx + w] = 1;
+// Morphological closing
+function binaryClosing(mask, w, h, iterations = 2) {
+  let cur = new Uint8Array(mask);
+  for (let it = 0; it < iterations; it++) {
+    const dilated = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        if (cur[row + x]) {
+          dilated[row + x] = 1;
+          if (x > 0) dilated[row + x - 1] = 1;
+          if (x < w - 1) dilated[row + x + 1] = 1;
+          if (y > 0) dilated[row - w + x] = 1;
+          if (y < h - 1) dilated[row + w + x] = 1;
+        }
       }
     }
+    cur = dilated;
   }
-  const closed = new Uint8Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    const row = y * w;
-    for (let x = 1; x < w - 1; x++) {
-      const idx = row + x;
-      if (dilated[idx] && dilated[idx - 1] && dilated[idx + 1] && dilated[idx - w] && dilated[idx + w]) {
-        closed[idx] = 1;
+  for (let it = 0; it < iterations; it++) {
+    const eroded = new Uint8Array(w * h);
+    for (let y = 1; y < h - 1; y++) {
+      const row = y * w;
+      for (let x = 1; x < w - 1; x++) {
+        if (cur[row + x] &&
+            cur[row + x - 1] && cur[row + x + 1] &&
+            cur[row - w + x] && cur[row + w + x]) {
+          eroded[row + x] = 1;
+        }
       }
     }
+    cur = eroded;
   }
-  return closed;
+  return cur;
 }
 
-// Connected Component noise filtering: removes floating debris, border vignettes, and background grunge
+// Connected Component filtering
 function filterConnectedComponents(mask, w, h, data) {
   const visited = new Uint8Array(w * h);
   const cleanMask = new Uint8Array(w * h);
   const queue = new Int32Array(w * h);
-  const minSize = Math.max(40, Math.round((w * h) / 1500));
+  const minSize = Math.max(80, Math.round((w * h) / 1000));
 
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
       const startIdx = y * w + x;
       if (!mask[startIdx] || visited[startIdx]) continue;
 
@@ -156,18 +155,12 @@ function filterConnectedComponents(mask, w, h, data) {
       queue[tail++] = startIdx;
       visited[startIdx] = 1;
 
-      let sumG = 0;
-      let sumLum = 0;
-      let touchesBorder = false;
+      let sumG = 0, sumLum = 0;
 
       while (head < tail) {
         const cur = queue[head++];
         const cx = cur % w;
         const cy = Math.floor(cur / w);
-
-        if (cx <= 1 || cx >= w - 2 || cy <= 1 || cy >= h - 2) {
-          touchesBorder = true;
-        }
 
         const p = cur * 4;
         const r = data[p], g = data[p + 1], b = data[p + 2];
@@ -184,8 +177,8 @@ function filterConnectedComponents(mask, w, h, data) {
       const meanG = sumG / compSize;
       const meanLum = sumLum / compSize;
 
-      // Keep substantial chrome/metallic parts; drop dark corner vignette and tiny background debris
-      if (compSize >= minSize && meanG > 20 && meanLum > 35 && !touchesBorder) {
+      // Keep bright metallic tribal parts; discard dark corner vignette (lum < 30) & micro-specks
+      if (compSize >= minSize && meanG > 15 && meanLum > 35) {
         for (let i = 0; i < tail; i++) {
           cleanMask[queue[i]] = 1;
         }
@@ -193,6 +186,49 @@ function filterConnectedComponents(mask, w, h, data) {
     }
   }
   return cleanMask;
+}
+
+// Fill small internal reflection voids while preserving genuine tribal negative cutouts
+function fillSmallHoles(mask, w, h, maxHoleSize = 250) {
+  // Invert mask to find background regions
+  const visited = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  const filled = new Uint8Array(mask);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const startIdx = y * w + x;
+      if (mask[startIdx] || visited[startIdx]) continue;
+
+      let head = 0, tail = 0;
+      queue[tail++] = startIdx;
+      visited[startIdx] = 1;
+      let touchesBorder = false;
+
+      while (head < tail) {
+        const cur = queue[head++];
+        const cx = cur % w;
+        const cy = Math.floor(cur / w);
+
+        if (cx === 0 || cx === w - 1 || cy === 0 || cy === h - 1) {
+          touchesBorder = true;
+        }
+
+        if (cx > 0) { const n = cur - 1; if (!mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+        if (cx < w - 1) { const n = cur + 1; if (!mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+        if (cy > 0) { const n = cur - w; if (!mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+        if (cy < h - 1) { const n = cur + w; if (!mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+      }
+
+      // If it is an enclosed hole smaller than threshold (e.g. reflection crevices inside horns)
+      if (!touchesBorder && tail < maxHoleSize) {
+        for (let i = 0; i < tail; i++) {
+          filled[queue[i]] = 1;
+        }
+      }
+    }
+  }
+  return filled;
 }
 
 // --- App State & DOM Elements ---
@@ -263,21 +299,21 @@ function init3D() {
   controls.maxDistance = 1000;
   controls.minDistance = 20;
 
-  // Lighting
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.45);
+  // Studio Lighting
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
   scene.add(ambientLight);
 
-  const mainLight = new THREE.DirectionalLight(0xffffff, 0.95);
-  mainLight.position.set(100, 120, 200);
+  const mainLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  mainLight.position.set(120, 140, 220);
   mainLight.castShadow = true;
   scene.add(mainLight);
 
-  const fillLight = new THREE.DirectionalLight(0x90b0ff, 0.5);
+  const fillLight = new THREE.DirectionalLight(0xa5b4fc, 0.55);
   fillLight.position.set(-150, -100, 100);
   scene.add(fillLight);
 
-  const rimLight = new THREE.DirectionalLight(0xec4899, 0.45);
-  rimLight.position.set(0, 200, 50);
+  const rimLight = new THREE.DirectionalLight(0xf472b6, 0.45);
+  rimLight.position.set(0, 220, 60);
   scene.add(rimLight);
 
   // Bed Grid Floor
@@ -309,8 +345,8 @@ function animate() {
 
 function getActiveMaterial() {
   const matConfig = {
-    chrome: { color: 0xd8dde6, metalness: 0.9, roughness: 0.15 },
-    pink: { color: 0xec4899, metalness: 0.1, roughness: 0.4 },
+    chrome: { color: 0xdde3ea, metalness: 0.92, roughness: 0.12 },
+    pink: { color: 0xec4899, metalness: 0.1, roughness: 0.35 },
     cyan: { color: 0x06b6d4, metalness: 0.2, roughness: 0.35 },
     gold: { color: 0xf59e0b, metalness: 0.85, roughness: 0.2 },
     clay: { color: 0xa8a29e, metalness: 0.0, roughness: 0.85 }
@@ -325,7 +361,7 @@ function getActiveMaterial() {
   });
 }
 
-// --- Image Loading & Mask Processing ---
+// --- Image Loading & Segmentation ---
 function loadImage(src, name) {
   showLoader("Loading source image...");
   const img = new Image();
@@ -367,7 +403,6 @@ function getMaskFromImage(img, maxSize) {
   const imgData = ctx.getImageData(0, 0, w, h);
   const data = imgData.data;
   const rawMask = new Uint8Array(w * h);
-  const luminance = new Float32Array(w * h);
   const mode = dom.maskMode.value;
   const lumThresh = parseFloat(dom.lumThreshold.value) / 100;
 
@@ -378,13 +413,12 @@ function getMaskFromImage(img, maxSize) {
     const a = data[i + 3];
 
     const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
-    luminance[p] = lum;
 
     let isForeground = false;
     if (mode === "tribal") {
-      // Rejection of dark red textured background:
-      // Background is characterized by high Red, very low Green (g < 35), and r > 1.8*g & r > 1.8*b.
-      const isBg = (r > 35) && (r > 1.8 * g) && (r > 1.8 * b) && (g < 35);
+      // Precise chromatic separation:
+      // Textured background is heavily red: r > 35, g <= 35, b <= 75, r > 1.8*g & r > 1.8*b
+      const isBg = (r > 35) && (r > 1.8 * g) && (r > 1.8 * b) && (g < 35) && (b < 75);
       isForeground = !isBg;
     } else if (mode === "bright") {
       isForeground = lum >= lumThresh && a > 30;
@@ -398,13 +432,15 @@ function getMaskFromImage(img, maxSize) {
 
   let finalMask = rawMask;
   if (mode === "tribal") {
-    // 1. Close gaps inside dark reflection bands
-    const closed = binaryClosing(rawMask, w, h);
-    // 2. Discard border vignette and tiny floating noise
-    finalMask = filterConnectedComponents(closed, w, h, data);
+    // 1. Morphological closing to seal internal crevice reflections
+    const closed = binaryClosing(rawMask, w, h, 2);
+    // 2. Filter components (removes corner vignette and background debris)
+    const filtered = filterConnectedComponents(closed, w, h, data);
+    // 3. Fill small internal reflection voids while preserving tribal cutouts
+    finalMask = fillSmallHoles(filtered, w, h, 250);
   }
 
-  return { w, h, mask: finalMask, luminance, canvas };
+  return { w, h, mask: finalMask, canvas };
 }
 
 function updateMaskPreview() {
@@ -436,7 +472,7 @@ function build3DModel() {
   if (!state.image) return;
 
   const startTime = performance.now();
-  showLoader("Sculpting Clean 3D Watertight Geometry...");
+  showLoader("Sculpting Organic Watertight Geometry...");
 
   setTimeout(() => {
     const maxSize = parseInt(dom.maxResolution.value, 10);
@@ -445,19 +481,33 @@ function build3DModel() {
     const bevelHeight = parseFloat(dom.bevelHeight.value);
     const sigma = parseFloat(dom.smoothingSigma.value);
 
-    const { w, h, mask: rawMask, luminance } = getMaskFromImage(state.image, maxSize);
+    const { w, h, mask: rawMask } = getMaskFromImage(state.image, maxSize);
 
-    // Compute Distance Transform on clean mask
+    // Compute exact Euclidean Distance Transform
     const dist = distanceTransform(rawMask, w, h);
 
-    // Blend distance bevel (75%) with surface luminance shading (25%)
-    let heightProfile = new Float32Array(w * h);
+    // Organic Pillowed Bevel:
+    // Fixed bevel radius ensures fine tips and swirls rise up to full height without being flattened
+    const bevelRadius = 9.0;
+    let maxDist = 0;
+    const sculpted = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
-      heightProfile[i] = (dist[i] * 0.75) + (luminance[i] * 0.25);
+      if (dist[i] > maxDist) maxDist = dist[i];
+      const u = Math.min(1.0, dist[i] / bevelRadius);
+      sculpted[i] = 3 * (u * u) - 2 * (u * u * u);
     }
-    heightProfile = gaussianFilter(heightProfile, w, h, sigma);
 
-    // Build padded Z grid: pad width = 1 so boundaries close cleanly
+    // Broad gentle dome over larger areas
+    const heightProfile = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const broad = Math.sin((dist[i] / (maxDist + 1e-5)) * (Math.PI / 2)) * 0.25;
+      heightProfile[i] = sculpted[i] * 0.8 + broad;
+    }
+
+    // Gaussian filter removes any faceted roughness for a smooth molded finish
+    const smoothProfile = gaussianFilter(heightProfile, w, h, sigma);
+
+    // Pad grid by 1 pixel for clean boundary sealing
     const paddedW = w + 2;
     const paddedH = h + 2;
     const Z = new Float32Array(paddedW * paddedH);
@@ -469,7 +519,7 @@ function build3DModel() {
         const padIdx = (r + 1) * paddedW + (c + 1);
         if (rawMask[rawIdx]) {
           mask[padIdx] = 1;
-          Z[padIdx] = baseThickness + (heightProfile[rawIdx] * bevelHeight);
+          Z[padIdx] = baseThickness + (smoothProfile[rawIdx] * bevelHeight);
         }
       }
     }
@@ -497,31 +547,27 @@ function build3DModel() {
           const z00 = Z[p00], z10 = Z[p10];
           const z01 = Z[p01], z11 = Z[p11];
 
-          // Top sculpted surface (2 triangles)
+          // Top sculpted surface
           addTri(x0, y0, z00,  x0, y1, z01,  x1, y0, z10);
           addTri(x1, y0, z10,  x0, y1, z01,  x1, y1, z11);
 
-          // Flat bottom surface at Z=0 (2 triangles, reversed winding)
+          // Flat bottom surface (Z=0)
           addTri(x0, y0, 0,  x1, y0, 0,  x0, y1, 0);
           addTri(x1, y0, 0,  x1, y1, 0,  x0, y1, 0);
 
-          // Watertight side walls
-          // North boundary
+          // Watertight vertical boundary walls
           if (r === 0 || !mask[(r - 1) * paddedW + c]) {
             addTri(x0, y0, 0,  x0, y0, z00,  x1, y0, z10);
             addTri(x0, y0, 0,  x1, y0, z10,  x1, y0, 0);
           }
-          // South boundary
           if (r === paddedH - 2 || !mask[(r + 1) * paddedW + c]) {
             addTri(x0, y1, 0,  x1, y1, z11,  x0, y1, z01);
             addTri(x0, y1, 0,  x1, y1, 0,    x1, y1, z11);
           }
-          // West boundary
           if (c === 0 || !mask[r * paddedW + (c - 1)]) {
             addTri(x0, y0, 0,  x0, y1, z01,  x0, y0, z00);
             addTri(x0, y0, 0,  x0, y1, 0,    x0, y1, z01);
           }
-          // East boundary
           if (c === paddedW - 2 || !mask[r * paddedW + (c + 1)]) {
             addTri(x1, y0, 0,  x1, y0, z10,  x1, y1, z11);
             addTri(x1, y0, 0,  x1, y1, z11,  x1, y1, 0);
@@ -533,7 +579,7 @@ function build3DModel() {
     const vertexFloatArray = new Float32Array(vertices);
     const numTriangles = vertices.length / 9;
 
-    // Center mesh around origin on bed
+    // Center mesh around origin
     const cx = (paddedW * scale) / 2;
     const cy = (paddedH * scale) / 2;
     for (let i = 0; i < vertexFloatArray.length; i += 3) {
@@ -541,12 +587,11 @@ function build3DModel() {
       vertexFloatArray[i + 1] -= cy;
     }
 
-    // Build Three.js Geometry
+    // Three.js BufferGeometry
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(vertexFloatArray, 3));
     geometry.computeVertexNormals();
 
-    // Clear old mesh
     while (meshGroup.children.length > 0) {
       const obj = meshGroup.children[0];
       if (obj.geometry) obj.geometry.dispose();
@@ -558,15 +603,12 @@ function build3DModel() {
     mesh.receiveShadow = true;
     meshGroup.add(mesh);
 
-    // Compute dimensions
     const lengthY = (paddedH * scale).toFixed(1);
     const heightZ = (baseThickness + bevelHeight).toFixed(1);
 
-    // Generate Binary STL
     state.stlBlob = createBinarySTL(vertexFloatArray, numTriangles);
     dom.downloadBtn.disabled = false;
 
-    // Update HUD
     const elapsed = Math.round(performance.now() - startTime);
     dom.hudTriangles.textContent = numTriangles.toLocaleString();
     dom.hudDims.textContent = `${widthMm.toFixed(0)} × ${lengthY} × ${heightZ} mm`;
@@ -582,13 +624,11 @@ function createBinarySTL(vertices, numTriangles) {
   const buffer = new ArrayBuffer(bufferSize);
   const view = new DataView(buffer);
 
-  // 80-byte header
   const headerStr = "GeminiSTL Watertight Binary Mesh Export";
   for (let i = 0; i < 80; i++) {
     view.setUint8(i, i < headerStr.length ? headerStr.charCodeAt(i) : 0);
   }
 
-  // Number of triangles (uint32)
   view.setUint32(80, numTriangles, true);
 
   let offset = 84;
@@ -598,7 +638,6 @@ function createBinarySTL(vertices, numTriangles) {
     const bx = vertices[vIdx + 3], by = vertices[vIdx + 4], bz = vertices[vIdx + 5];
     const cx = vertices[vIdx + 6], cy = vertices[vIdx + 7], cz = vertices[vIdx + 8];
 
-    // Compute facet normal: (B - A) x (C - A)
     const abx = bx - ax, aby = by - ay, abz = bz - az;
     const acx = cx - ax, acy = cy - ay, acz = cz - az;
     let nx = aby * acz - abz * acy;
@@ -607,12 +646,10 @@ function createBinarySTL(vertices, numTriangles) {
     const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
     if (len > 0) { nx /= len; ny /= len; nz /= len; }
 
-    // Normal
     view.setFloat32(offset, nx, true); offset += 4;
     view.setFloat32(offset, ny, true); offset += 4;
     view.setFloat32(offset, nz, true); offset += 4;
 
-    // Vertices A, B, C
     view.setFloat32(offset, ax, true); offset += 4;
     view.setFloat32(offset, ay, true); offset += 4;
     view.setFloat32(offset, az, true); offset += 4;
@@ -625,7 +662,6 @@ function createBinarySTL(vertices, numTriangles) {
     view.setFloat32(offset, cy, true); offset += 4;
     view.setFloat32(offset, cz, true); offset += 4;
 
-    // 2-byte attribute byte count
     view.setUint16(offset, 0, true); offset += 2;
   }
 

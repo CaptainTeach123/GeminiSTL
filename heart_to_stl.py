@@ -1,107 +1,141 @@
+import os
 import numpy as np
 from PIL import Image
-from scipy.ndimage import distance_transform_edt, gaussian_filter, label, binary_closing, generate_binary_structure
+from scipy.ndimage import (
+    distance_transform_edt,
+    gaussian_filter,
+    label,
+    binary_closing,
+    binary_fill_holes,
+    generate_binary_structure
+)
 from stl import mesh
 
 def create_heart_stl(
     image_path="high_res.png",
     output_stl="tribal_heart.stl",
-    max_size=350,          # Grid resolution (higher = smoother edges, larger file)
+    max_size=450,          # High resolution for smooth curves without stepping
     width_mm=120.0,        # Physical width of the 3D print in millimeters
     base_thickness=3.0,    # Solid base thickness in mm
     bevel_height=4.5,      # Additional sculpted bevel height in mm
+    bevel_radius_px=9.0,   # Transition width for smooth organic pillowed bevel
 ):
+    if not os.path.isabs(image_path):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        image_path = os.path.join(base_dir, image_path)
+    if not os.path.isabs(output_stl):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        output_stl = os.path.join(base_dir, output_stl)
+
     print(f"Loading {image_path}...")
     img = Image.open(image_path).convert("RGB")
     
-    # Resize while keeping aspect ratio for clean, fast mesh generation
-    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-    arr = np.array(img, dtype=np.float32)
+    # 1. Full-resolution chromatic segmentation:
+    # Background is textured red grunge (high R, low G <= 35, low B <= 75, R > 1.8*G & R > 1.8*B).
+    # Heart contains chrome (balanced R≈G≈B), neon pink (high B >= 70, R >= 110), and dark reflections.
+    arr_full = np.array(img, dtype=np.float32)
+    R_f, G_f, B_f = arr_full[:, :, 0], arr_full[:, :, 1], arr_full[:, :, 2]
+    lum_f = 0.299 * R_f + 0.587 * G_f + 0.114 * B_f
     
-    R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-    
-    # 1. Advanced background separation:
-    # The textured background has high Red, but very low Green (G <= 30) and low Blue.
-    # Background satisfies: (R > 35) & (R > 1.8 * G) & (R > 1.8 * B) & (G < 35)
-    is_bg = (R > 35) & (R > 1.8 * G) & (R > 1.8 * B) & (G < 35)
+    is_bg = (R_f > 35) & (R_f > 1.8 * G_f) & (R_f > 1.8 * B_f) & (G_f < 35) & (B_f < 75)
     raw_mask = ~is_bg
     
-    # 2. Morphological closing to seal fine creases/reflection borders inside chrome facets
-    struct = generate_binary_structure(2, 2)
-    closed_mask = binary_closing(raw_mask, structure=struct, iterations=1)
-    
-    # 3. Connected component filtering: eliminates background grunge, floating speckles, and corner vignettes
-    labeled, num_features = label(closed_mask)
+    # Discard corner vignette and isolated background noise using connected components
+    labeled, num_features = label(raw_mask)
     sizes = np.bincount(labeled.ravel())
     
-    border_labels = set(labeled[0, :]).union(labeled[-1, :]).union(labeled[:, 0]).union(labeled[:, -1])
-    
-    mask = np.zeros_like(closed_mask, dtype=bool)
+    clean_mask = np.zeros_like(raw_mask, dtype=bool)
     for lbl in range(1, num_features + 1):
-        sz = sizes[lbl]
-        if sz < 80 or lbl in border_labels:
+        if sizes[lbl] < 1000:
             continue
-        comp_pixels = arr[labeled == lbl]
-        mean_g = comp_pixels[:, 1].mean()
-        mean_lum = (0.299 * comp_pixels[:, 0] + 0.587 * comp_pixels[:, 1] + 0.114 * comp_pixels[:, 2]).mean()
-        # Keep bright chrome / metallic components, discard dark vignette/noise
-        if mean_g > 20 and mean_lum > 35:
-            mask |= (labeled == lbl)
+        comp_lum = lum_f[labeled == lbl].mean()
+        comp_g = G_f[labeled == lbl].mean()
+        # Keep bright chrome/metallic components, drop dark corner vignette (lum < 30)
+        if comp_lum > 35 and comp_g > 15:
+            clean_mask |= (labeled == lbl)
             
-    print(f"Isolated clean foreground heart mesh ({mask.sum()} grid cells)...")
+    # Bridge internal metallic reflection crevices inside the solid horns
+    struct = generate_binary_structure(2, 2)
+    mask_closed = binary_closing(clean_mask, structure=struct, iterations=3)
     
-    # Compute distance from the outer edges to create a sculpted 3D bevel
-    dist = distance_transform_edt(mask)
-    if dist.max() > 0:
-        dist = dist / dist.max()
+    # Smart hole fill: close metallic reflection gaps, but keep genuine tribal negative cutouts
+    all_filled = binary_fill_holes(mask_closed)
+    holes = all_filled ^ mask_closed
+    hole_labeled, hole_num = label(holes)
+    final_full_mask = mask_closed.copy()
+    for h_lbl in range(1, hole_num + 1):
+        h_pix = arr_full[hole_labeled == h_lbl]
+        mean_r = h_pix[:, 0].mean()
+        mean_g = h_pix[:, 1].mean()
+        # If the hole is a dark reflection gap, fill it. If it has red background, keep it open!
+        if mean_r < 45 and mean_g < 25:
+            final_full_mask |= (hole_labeled == h_lbl)
+            
+    # 2. Resample clean mask to target grid resolution
+    aspect = final_full_mask.shape[0] / final_full_mask.shape[1]
+    target_w = max_size
+    target_h = int(target_w * aspect)
+    mask_img = Image.fromarray(final_full_mask.astype(np.uint8) * 255).resize(
+        (target_w, target_h), Image.Resampling.BILINEAR
+    )
+    mask_grid = np.array(mask_img) > 128
     
-    # Blend distance bevel with surface shading for extra detail
-    luminance = (0.299 * R + 0.587 * G + 0.114 * B) / 255.0
-    height_profile = (dist * 0.75) + (luminance * 0.25)
-    height_profile = gaussian_filter(height_profile, sigma=1.0)
+    print(f"Generating smooth sculpted relief on {target_w}x{target_h} grid...")
+    
+    # 3. Organic pillowed bevel:
+    # Uses a smoothstep curve over a fixed radius so delicate tips and barbs rise to full height
+    dist = distance_transform_edt(mask_grid)
+    u = np.clip(dist / bevel_radius_px, 0.0, 1.0)
+    sculpted = 3 * (u ** 2) - 2 * (u ** 3)
+    
+    # Gentle broad dome over larger wing areas
+    broad_dome = np.sin((dist / (dist.max() + 1e-5)) * (np.pi / 2)) * 0.25
+    profile = sculpted * 0.8 + broad_dome
+    
+    # Gaussian filter for organic, silky smooth finish (removes faceted roughness)
+    profile = gaussian_filter(profile, sigma=0.8)
     
     # Total Z height map
-    Z = np.where(mask, base_thickness + (height_profile * bevel_height), 0.0)
+    Z = np.where(mask_grid, base_thickness + (profile * bevel_height), 0.0)
     
-    # Pad edges with zeros so the outer boundary closes cleanly
+    # Pad edges with zeros so side walls seal cleanly
     Z = np.pad(Z, pad_width=1, mode="constant", constant_values=0.0)
-    mask = Z > 0
+    mask_grid = Z > 0
     
     H, W = Z.shape
     scale = width_mm / W
     
     faces = []
-    print("Building 3D watertight geometry...")
+    print("Building watertight 3D solid mesh...")
     
     for r in range(H - 1):
         for c in range(W - 1):
-            if mask[r, c] or mask[r+1, c] or mask[r, c+1] or mask[r+1, c+1]:
+            if mask_grid[r, c] or mask_grid[r+1, c] or mask_grid[r, c+1] or mask_grid[r+1, c+1]:
                 x0, x1 = c * scale, (c + 1) * scale
-                # Flip Y so the heart isn't upside down
                 y0, y1 = (H - r) * scale, (H - (r + 1)) * scale
                 
                 z00, z10 = Z[r, c], Z[r, c+1]
                 z01, z11 = Z[r+1, c], Z[r+1, c+1]
                 
-                # Top sculpted surface (2 triangles)
+                # Top sculpted surface
                 faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y0, z10]])
                 faces.append([[x1, y0, z10], [x0, y1, z01], [x1, y1, z11]])
                 
-                # Flat bottom surface at Z=0 (2 triangles, reversed winding)
+                # Flat bottom base (Z=0)
                 faces.append([[x0, y0, 0], [x1, y0, 0], [x0, y1, 0]])
                 faces.append([[x1, y0, 0], [x1, y1, 0], [x0, y1, 0]])
                 
-                # Side walls wherever a pixel transitions to empty background
-                if r == 0 or not mask[r-1, c]:
+                # Watertight vertical boundary walls
+                if r == 0 or not mask_grid[r-1, c]:
                     faces.append([[x0, y0, 0], [x0, y0, z00], [x1, y0, z10]])
                     faces.append([[x0, y0, 0], [x1, y0, z10], [x1, y0, 0]])
-                if r == H - 2 or not mask[r+1, c]:
+                if r == H - 2 or not mask_grid[r+1, c]:
                     faces.append([[x0, y1, 0], [x1, y1, z11], [x0, y1, z01]])
                     faces.append([[x0, y1, 0], [x1, y1, 0], [x1, y1, z11]])
-                if c == 0 or not mask[r, c-1]:
+                if c == 0 or not mask_grid[r, c-1]:
                     faces.append([[x0, y0, 0], [x0, y1, z01], [x0, y0, z00]])
                     faces.append([[x0, y0, 0], [x0, y1, 0], [x0, y1, z01]])
-                if c == W - 2 or not mask[r, c+1]:
+                if c == W - 2 or not mask_grid[r, c+1]:
                     faces.append([[x1, y0, 0], [x1, y0, z10], [x1, y1, z11]])
                     faces.append([[x1, y0, 0], [x1, y1, z11], [x1, y1, 0]])
 
@@ -111,7 +145,7 @@ def create_heart_stl(
         heart_mesh.vectors[i] = f
         
     heart_mesh.save(output_stl)
-    print(f"Success! Saved {output_stl} ({len(faces_arr)} triangles).")
+    print(f"Success! Saved {output_stl} ({len(faces_arr):,} triangles).")
 
 if __name__ == "__main__":
     create_heart_stl()
