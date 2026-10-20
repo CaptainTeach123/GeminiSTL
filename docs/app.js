@@ -1,7 +1,7 @@
 /**
  * GeminiSTL - High-Precision Watertight 3D STL Mesh Generator
- * Features chromatic background rejection, smart reflection sealing,
- * organic pillowed bevel sculpting (zero detail loss), and Three.js 3D viewport.
+ * Features chiseled tribal blade ridge sculpting, smart reflection notch healing,
+ * studio lighting and Three.js 3D viewport.
  */
 
 // --- Euclidean Distance Transform (Felzenszwalb & Huttenlocher 1D/2D) ---
@@ -103,8 +103,8 @@ function gaussianFilter(arr, w, h, sigma) {
   return out;
 }
 
-// Morphological closing
-function binaryClosing(mask, w, h, iterations = 2) {
+// Morphological closing (iterations=5 to seal horn reflection crevices completely)
+function binaryClosing(mask, w, h, iterations = 5) {
   let cur = new Uint8Array(mask);
   for (let it = 0; it < iterations; it++) {
     const dilated = new Uint8Array(w * h);
@@ -139,12 +139,12 @@ function binaryClosing(mask, w, h, iterations = 2) {
   return cur;
 }
 
-// Connected Component filtering
+// Connected Component filtering: removes background debris & dark corner vignette
 function filterConnectedComponents(mask, w, h, data) {
   const visited = new Uint8Array(w * h);
   const cleanMask = new Uint8Array(w * h);
   const queue = new Int32Array(w * h);
-  const minSize = Math.max(80, Math.round((w * h) / 1000));
+  const minSize = Math.max(60, Math.round((w * h) / 1200));
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -177,8 +177,7 @@ function filterConnectedComponents(mask, w, h, data) {
       const meanG = sumG / compSize;
       const meanLum = sumLum / compSize;
 
-      // Keep bright metallic tribal parts; discard dark corner vignette (lum < 30) & micro-specks
-      if (compSize >= minSize && meanG > 15 && meanLum > 35) {
+      if (compSize >= minSize && meanLum > 30 && (meanG > 15 || compSize > 400)) {
         for (let i = 0; i < tail; i++) {
           cleanMask[queue[i]] = 1;
         }
@@ -188,9 +187,8 @@ function filterConnectedComponents(mask, w, h, data) {
   return cleanMask;
 }
 
-// Fill small internal reflection voids while preserving genuine tribal negative cutouts
-function fillSmallHoles(mask, w, h, maxHoleSize = 250) {
-  // Invert mask to find background regions
+// Fill internal reflection voids while preserving genuine tribal negative cutouts
+function fillSmallHoles(mask, w, h, maxHoleSize = 300) {
   const visited = new Uint8Array(w * h);
   const queue = new Int32Array(w * h);
   const filled = new Uint8Array(mask);
@@ -220,7 +218,6 @@ function fillSmallHoles(mask, w, h, maxHoleSize = 250) {
         if (cy < h - 1) { const n = cur + w; if (!mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
       }
 
-      // If it is an enclosed hole smaller than threshold (e.g. reflection crevices inside horns)
       if (!touchesBorder && tail < maxHoleSize) {
         for (let i = 0; i < tail; i++) {
           filled[queue[i]] = 1;
@@ -275,7 +272,7 @@ const dom = {
 
 // --- Three.js 3D Viewer Setup ---
 let scene, camera, renderer, controls, meshGroup;
-let currentMaterialMode = "chrome";
+let currentMaterialMode = "studio";
 let isWireframe = false;
 
 function init3D() {
@@ -299,21 +296,21 @@ function init3D() {
   controls.maxDistance = 1000;
   controls.minDistance = 20;
 
-  // Studio Lighting
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
-  scene.add(ambientLight);
+  // Studio Lighting (eliminates dark voids, reveals all 3D curves)
+  const hemiLight = new THREE.HemisphereLight(0xffffff, 0x1e293b, 0.75);
+  scene.add(hemiLight);
 
-  const mainLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  const mainLight = new THREE.DirectionalLight(0xffffff, 0.95);
   mainLight.position.set(120, 140, 220);
   mainLight.castShadow = true;
   scene.add(mainLight);
 
-  const fillLight = new THREE.DirectionalLight(0xa5b4fc, 0.55);
-  fillLight.position.set(-150, -100, 100);
+  const fillLight = new THREE.DirectionalLight(0xa5b4fc, 0.5);
+  fillLight.position.set(-150, -100, 120);
   scene.add(fillLight);
 
-  const rimLight = new THREE.DirectionalLight(0xf472b6, 0.45);
-  rimLight.position.set(0, 220, 60);
+  const rimLight = new THREE.DirectionalLight(0xf472b6, 0.4);
+  rimLight.position.set(0, 220, 80);
   scene.add(rimLight);
 
   // Bed Grid Floor
@@ -345,13 +342,14 @@ function animate() {
 
 function getActiveMaterial() {
   const matConfig = {
-    chrome: { color: 0xdde3ea, metalness: 0.92, roughness: 0.12 },
+    studio: { color: 0xe2e8f0, metalness: 0.15, roughness: 0.35 },
+    chrome: { color: 0xdde3ea, metalness: 0.85, roughness: 0.2 },
     pink: { color: 0xec4899, metalness: 0.1, roughness: 0.35 },
     cyan: { color: 0x06b6d4, metalness: 0.2, roughness: 0.35 },
     gold: { color: 0xf59e0b, metalness: 0.85, roughness: 0.2 },
     clay: { color: 0xa8a29e, metalness: 0.0, roughness: 0.85 }
   };
-  const cfg = matConfig[currentMaterialMode] || matConfig.chrome;
+  const cfg = matConfig[currentMaterialMode] || matConfig.studio;
   return new THREE.MeshStandardMaterial({
     color: cfg.color,
     metalness: cfg.metalness,
@@ -416,9 +414,8 @@ function getMaskFromImage(img, maxSize) {
 
     let isForeground = false;
     if (mode === "tribal") {
-      // Precise chromatic separation:
-      // Textured background is heavily red: r > 35, g <= 35, b <= 75, r > 1.8*g & r > 1.8*b
-      const isBg = (r > 35) && (r > 1.8 * g) && (r > 1.8 * b) && (g < 35) && (b < 75);
+      // Rejection of red textured background (capped at r <= 205 so bright red metallic highlights remain):
+      const isBg = (r > 35) && (r <= 205) && (r > 1.8 * g) && (r > 1.8 * b) && (g < 35) && (b < 75);
       isForeground = !isBg;
     } else if (mode === "bright") {
       isForeground = lum >= lumThresh && a > 30;
@@ -432,12 +429,12 @@ function getMaskFromImage(img, maxSize) {
 
   let finalMask = rawMask;
   if (mode === "tribal") {
-    // 1. Morphological closing to seal internal crevice reflections
-    const closed = binaryClosing(rawMask, w, h, 2);
-    // 2. Filter components (removes corner vignette and background debris)
-    const filtered = filterConnectedComponents(closed, w, h, data);
+    // 1. Filter out corner vignette & isolated debris
+    const filtered = filterConnectedComponents(rawMask, w, h, data);
+    // 2. Close gaps and seal horn reflection crevices (5 iterations)
+    const closed = binaryClosing(filtered, w, h, 5);
     // 3. Fill small internal reflection voids while preserving tribal cutouts
-    finalMask = fillSmallHoles(filtered, w, h, 250);
+    finalMask = fillSmallHoles(closed, w, h, 300);
   }
 
   return { w, h, mask: finalMask, canvas };
@@ -453,7 +450,7 @@ function updateMaskPreview() {
   const imgData = ctx.createImageData(w, h);
   for (let i = 0, p = 0; i < mask.length; i++, p += 4) {
     if (mask[i]) {
-      imgData.data[p] = 59;     // Blue accent
+      imgData.data[p] = 59;
       imgData.data[p + 1] = 130;
       imgData.data[p + 2] = 246;
       imgData.data[p + 3] = 255;
@@ -467,12 +464,12 @@ function updateMaskPreview() {
   ctx.putImageData(imgData, 0, 0);
 }
 
-// --- 3D Mesh Generation & Watertight Closure ---
+// --- 3D Mesh Generation & Chiseled Ridge Profiling ---
 function build3DModel() {
   if (!state.image) return;
 
   const startTime = performance.now();
-  showLoader("Sculpting Organic Watertight Geometry...");
+  showLoader("Sculpting Chiseled 3D Blade Ridges...");
 
   setTimeout(() => {
     const maxSize = parseInt(dom.maxResolution.value, 10);
@@ -486,26 +483,22 @@ function build3DModel() {
     // Compute exact Euclidean Distance Transform
     const dist = distanceTransform(rawMask, w, h);
 
-    // Organic Pillowed Bevel:
-    // Fixed bevel radius ensures fine tips and swirls rise up to full height without being flattened
-    const bevelRadius = 9.0;
+    // Chiseled tribal blade ridge profile:
+    // Power-law curve (p=0.55) produces prominent, continuous 3D blade crests along every horn,
+    // swirl, and barb, eliminating flat table tops and hollow dents.
     let maxDist = 0;
-    const sculpted = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       if (dist[i] > maxDist) maxDist = dist[i];
-      const u = Math.min(1.0, dist[i] / bevelRadius);
-      sculpted[i] = 3 * (u * u) - 2 * (u * u * u);
     }
+    maxDist += 1e-5;
 
-    // Broad gentle dome over larger areas
-    const heightProfile = new Float32Array(w * h);
+    const chiseledProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
-      const broad = Math.sin((dist[i] / (maxDist + 1e-5)) * (Math.PI / 2)) * 0.25;
-      heightProfile[i] = sculpted[i] * 0.8 + broad;
+      chiseledProfile[i] = Math.pow(dist[i] / maxDist, 0.55);
     }
 
-    // Gaussian filter removes any faceted roughness for a smooth molded finish
-    const smoothProfile = gaussianFilter(heightProfile, w, h, sigma);
+    // Gaussian smoothing removes step roughness while preserving the ridge line
+    const smoothProfile = gaussianFilter(chiseledProfile, w, h, sigma);
 
     // Pad grid by 1 pixel for clean boundary sealing
     const paddedW = w + 2;

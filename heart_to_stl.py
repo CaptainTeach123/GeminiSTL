@@ -14,11 +14,10 @@ from stl import mesh
 def create_heart_stl(
     image_path="high_res.png",
     output_stl="tribal_heart.stl",
-    max_size=450,          # High resolution for smooth curves without stepping
+    max_size=650,          # High resolution for razor-sharp curves and smooth edges
     width_mm=120.0,        # Physical width of the 3D print in millimeters
     base_thickness=3.0,    # Solid base thickness in mm
-    bevel_height=4.5,      # Additional sculpted bevel height in mm
-    bevel_radius_px=9.0,   # Transition width for smooth organic pillowed bevel
+    bevel_height=4.5,      # Chiseled blade ridge height in mm
 ):
     if not os.path.isabs(image_path):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,34 +30,33 @@ def create_heart_stl(
     img = Image.open(image_path).convert("RGB")
     
     # 1. Full-resolution chromatic segmentation:
-    # Background is textured red grunge (high R, low G <= 35, low B <= 75, R > 1.8*G & R > 1.8*B).
-    # Heart contains chrome (balanced R≈G≈B), neon pink (high B >= 70, R >= 110), and dark reflections.
+    # Reject red grunge canvas: R > 35, R <= 205, G <= 35, B <= 75, R > 1.8*G & R > 1.8*B
     arr_full = np.array(img, dtype=np.float32)
     R_f, G_f, B_f = arr_full[:, :, 0], arr_full[:, :, 1], arr_full[:, :, 2]
     lum_f = 0.299 * R_f + 0.587 * G_f + 0.114 * B_f
     
-    is_bg = (R_f > 35) & (R_f > 1.8 * G_f) & (R_f > 1.8 * B_f) & (G_f < 35) & (B_f < 75)
+    # Background rejection (capped at 205 so bright red metallic chrome highlights are preserved)
+    is_bg = (R_f > 35) & (R_f <= 205) & (R_f > 1.8 * G_f) & (R_f > 1.8 * B_f) & (G_f < 35) & (B_f < 75)
     raw_mask = ~is_bg
     
-    # Discard corner vignette and isolated background noise using connected components
+    # Filter out corner vignettes and small isolated debris
     labeled, num_features = label(raw_mask)
     sizes = np.bincount(labeled.ravel())
     
     clean_mask = np.zeros_like(raw_mask, dtype=bool)
     for lbl in range(1, num_features + 1):
-        if sizes[lbl] < 1000:
+        if sizes[lbl] < 500:
             continue
         comp_lum = lum_f[labeled == lbl].mean()
         comp_g = G_f[labeled == lbl].mean()
-        # Keep bright chrome/metallic components, drop dark corner vignette (lum < 30)
-        if comp_lum > 35 and comp_g > 15:
+        if comp_lum > 30 and comp_g > 15:
             clean_mask |= (labeled == lbl)
             
-    # Bridge internal metallic reflection crevices inside the solid horns
+    # Bridge and heal metallic reflection crevices so the horns remain uninterrupted solid blades
     struct = generate_binary_structure(2, 2)
-    mask_closed = binary_closing(clean_mask, structure=struct, iterations=3)
+    mask_closed = binary_closing(clean_mask, structure=struct, iterations=5)
     
-    # Smart hole fill: close metallic reflection gaps, but keep genuine tribal negative cutouts
+    # Smart hole fill: heal internal black reflection gaps, while keeping red background cutouts open
     all_filled = binary_fill_holes(mask_closed)
     holes = all_filled ^ mask_closed
     hole_labeled, hole_num = label(holes)
@@ -67,11 +65,10 @@ def create_heart_stl(
         h_pix = arr_full[hole_labeled == h_lbl]
         mean_r = h_pix[:, 0].mean()
         mean_g = h_pix[:, 1].mean()
-        # If the hole is a dark reflection gap, fill it. If it has red background, keep it open!
         if mean_r < 45 and mean_g < 25:
             final_full_mask |= (hole_labeled == h_lbl)
             
-    # 2. Resample clean mask to target grid resolution
+    # 2. Resample clean mask to high-resolution grid
     aspect = final_full_mask.shape[0] / final_full_mask.shape[1]
     target_w = max_size
     target_h = int(target_w * aspect)
@@ -80,23 +77,18 @@ def create_heart_stl(
     )
     mask_grid = np.array(mask_img) > 128
     
-    print(f"Generating smooth sculpted relief on {target_w}x{target_h} grid...")
+    print(f"Generating chiseled 3D blade geometry on {target_w}x{target_h} grid...")
     
-    # 3. Organic pillowed bevel:
-    # Uses a smoothstep curve over a fixed radius so delicate tips and barbs rise to full height
+    # 3. Chiseled tribal blade ridge profile:
+    # A power-law curve (p=0.55) produces sharp, prominent 3D blade crests that flow
+    # down the center of every horn, swirl, and barb, eliminating flat plateaus and dents.
     dist = distance_transform_edt(mask_grid)
-    u = np.clip(dist / bevel_radius_px, 0.0, 1.0)
-    sculpted = 3 * (u ** 2) - 2 * (u ** 3)
-    
-    # Gentle broad dome over larger wing areas
-    broad_dome = np.sin((dist / (dist.max() + 1e-5)) * (np.pi / 2)) * 0.25
-    profile = sculpted * 0.8 + broad_dome
-    
-    # Gaussian filter for organic, silky smooth finish (removes faceted roughness)
-    profile = gaussian_filter(profile, sigma=0.8)
+    max_d = dist.max() + 1e-5
+    chiseled_profile = (dist / max_d) ** 0.55
+    chiseled_profile = gaussian_filter(chiseled_profile, sigma=1.0)
     
     # Total Z height map
-    Z = np.where(mask_grid, base_thickness + (profile * bevel_height), 0.0)
+    Z = np.where(mask_grid, base_thickness + (chiseled_profile * bevel_height), 0.0)
     
     # Pad edges with zeros so side walls seal cleanly
     Z = np.pad(Z, pad_width=1, mode="constant", constant_values=0.0)
@@ -106,7 +98,7 @@ def create_heart_stl(
     scale = width_mm / W
     
     faces = []
-    print("Building watertight 3D solid mesh...")
+    print("Building watertight 3D mesh...")
     
     for r in range(H - 1):
         for c in range(W - 1):
@@ -121,11 +113,11 @@ def create_heart_stl(
                 faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y0, z10]])
                 faces.append([[x1, y0, z10], [x0, y1, z01], [x1, y1, z11]])
                 
-                # Flat bottom base (Z=0)
+                # Flat bottom surface (Z=0)
                 faces.append([[x0, y0, 0], [x1, y0, 0], [x0, y1, 0]])
                 faces.append([[x1, y0, 0], [x1, y1, 0], [x0, y1, 0]])
                 
-                # Watertight vertical boundary walls
+                # Watertight side walls
                 if r == 0 or not mask_grid[r-1, c]:
                     faces.append([[x0, y0, 0], [x0, y0, z00], [x1, y0, z10]])
                     faces.append([[x0, y0, 0], [x1, y0, z10], [x1, y0, 0]])
@@ -145,7 +137,7 @@ def create_heart_stl(
         heart_mesh.vectors[i] = f
         
     heart_mesh.save(output_stl)
-    print(f"Success! Saved {output_stl} ({len(faces_arr):,} triangles).")
+    print(f"Success! Saved {output_stl} ({len(faces_arr):,} watertight triangles).")
 
 if __name__ == "__main__":
     create_heart_stl()

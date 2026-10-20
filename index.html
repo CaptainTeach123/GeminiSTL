@@ -112,9 +112,9 @@
         <div class="control-group">
           <div class="control-label">
             <label for="maxResolution">Grid Resolution</label>
-            <span class="value-display" id="maxResolutionVal">300 px</span>
+            <span class="value-display" id="maxResolutionVal">600 px</span>
           </div>
-          <input type="range" id="maxResolution" min="120" max="450" step="10" value="300">
+          <input type="range" id="maxResolution" min="200" max="800" step="20" value="600">
           <span class="hint">Higher resolution = smoother curves, larger STL file</span>
         </div>
 
@@ -192,6 +192,7 @@
           </svg>
         </button>
         <select id="materialSelect" class="tool-select" title="Change Material / Shading">
+          <option value="studio" selected>Material: Studio Silver PLA</option>
           <option value="chrome">Material: Silver Chrome</option>
           <option value="pink">Material: Neon Pink PLA</option>
           <option value="cyan">Material: Cyan Resin</option>
