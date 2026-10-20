@@ -39,53 +39,52 @@ def create_heart_stl(
     is_bg = (R_f > 35) & (R_f <= 205) & (R_f > 1.8 * G_f) & (R_f > 1.8 * B_f) & (G_f < 35) & (B_f < 75)
     raw_mask = ~is_bg
     
-    # Filter out corner vignettes and small isolated debris
+    # Filter out corner vignettes and small isolated debris (NO perimeter dilation)
     labeled, num_features = label(raw_mask)
     sizes = np.bincount(labeled.ravel())
     
     clean_mask = np.zeros_like(raw_mask, dtype=bool)
     for lbl in range(1, num_features + 1):
-        if sizes[lbl] < 500:
+        if sizes[lbl] < 100:
             continue
         comp_lum = lum_f[labeled == lbl].mean()
         comp_g = G_f[labeled == lbl].mean()
-        if comp_lum > 30 and comp_g > 15:
+        if comp_lum > 30 and (comp_g > 10 or sizes[lbl] > 500):
             clean_mask |= (labeled == lbl)
             
-    # Bridge and heal metallic reflection crevices so the horns remain uninterrupted solid blades
-    struct = generate_binary_structure(2, 2)
-    mask_closed = binary_closing(clean_mask, structure=struct, iterations=5)
-    
-    # Smart hole fill: heal internal black reflection gaps, while keeping red background cutouts open
-    all_filled = binary_fill_holes(mask_closed)
-    holes = all_filled ^ mask_closed
+    # Smart internal void healing: seal small reflection crevices (< 600 px) inside the metal
+    # while keeping large genuine tribal negative cutouts (> 1000 px) 100% open (zero outer perimeter bloat!)
+    all_filled = binary_fill_holes(clean_mask)
+    holes = all_filled ^ clean_mask
     hole_labeled, hole_num = label(holes)
-    final_full_mask = mask_closed.copy()
+    hole_sizes = np.bincount(hole_labeled.ravel())
+    
+    final_full_mask = clean_mask.copy()
     for h_lbl in range(1, hole_num + 1):
-        h_pix = arr_full[hole_labeled == h_lbl]
-        mean_r = h_pix[:, 0].mean()
-        mean_g = h_pix[:, 1].mean()
-        if mean_r < 45 and mean_g < 25:
+        if hole_sizes[h_lbl] < 600:
             final_full_mask |= (hole_labeled == h_lbl)
             
     # 2. Resample clean mask to high-resolution grid
     aspect = final_full_mask.shape[0] / final_full_mask.shape[1]
     target_w = max_size
     target_h = int(target_w * aspect)
-    mask_img = Image.fromarray(final_full_mask.astype(np.uint8) * 255).resize(
+    mask_img = Image.fromarray((final_full_mask * 255).astype(np.uint8)).resize(
         (target_w, target_h), Image.Resampling.BILINEAR
     )
     mask_grid = np.array(mask_img) > 128
     
     print(f"Generating chiseled 3D blade geometry on {target_w}x{target_h} grid...")
     
-    # 3. Chiseled tribal blade ridge profile:
-    # A power-law curve (p=0.55) produces sharp, prominent 3D blade crests that flow
-    # down the center of every horn, swirl, and barb, eliminating flat plateaus and dents.
+    # 3. Precision Chiseled Tribal Blade Profile:
+    # Replaces bloated dome curvature with steep 45-degree edge chamfers (6px)
+    # and linear planar facets rising to the central ridge spine.
     dist = distance_transform_edt(mask_grid)
-    max_d = dist.max() + 1e-5
-    chiseled_profile = (dist / max_d) ** 0.55
-    chiseled_profile = gaussian_filter(chiseled_profile, sigma=1.0)
+    d_max = dist.max() + 1e-5
+    chamfer_w = 6.0
+    chamfer = np.clip(dist / chamfer_w, 0.0, 1.0)
+    ridge = dist / d_max
+    chiseled_profile = chamfer * 0.70 + ridge * 0.30
+    chiseled_profile = gaussian_filter(chiseled_profile, sigma=0.35)
     
     # Total Z height map
     Z = np.where(mask_grid, base_thickness + (chiseled_profile * bevel_height), 0.0)

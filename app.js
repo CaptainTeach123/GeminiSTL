@@ -429,12 +429,10 @@ function getMaskFromImage(img, maxSize) {
 
   let finalMask = rawMask;
   if (mode === "tribal") {
-    // 1. Filter out corner vignette & isolated debris
+    // 1. Filter out corner vignette & isolated debris on raw mask (NO dilation, zero bloat!)
     const filtered = filterConnectedComponents(rawMask, w, h, data);
-    // 2. Close gaps and seal horn reflection crevices (5 iterations)
-    const closed = binaryClosing(filtered, w, h, 5);
-    // 3. Fill small internal reflection voids while preserving tribal cutouts
-    finalMask = fillSmallHoles(closed, w, h, 300);
+    // 2. Fill small internal reflection voids while preserving genuine tribal cutouts
+    finalMask = fillSmallHoles(filtered, w, h, 200);
   }
 
   return { w, h, mask: finalMask, canvas };
@@ -483,22 +481,26 @@ function build3DModel() {
     // Compute exact Euclidean Distance Transform
     const dist = distanceTransform(rawMask, w, h);
 
-    // Chiseled tribal blade ridge profile:
-    // Power-law curve (p=0.55) produces prominent, continuous 3D blade crests along every horn,
-    // swirl, and barb, eliminating flat table tops and hollow dents.
+    // Precision Chiseled Tribal Blade Profile:
+    // Replaces bloated dome curvature with steep 45-degree edge chamfers (6px)
+    // and linear planar facets rising to the central ridge spine.
     let maxDist = 0;
     for (let i = 0; i < w * h; i++) {
       if (dist[i] > maxDist) maxDist = dist[i];
     }
     maxDist += 1e-5;
 
+    const chamferW = 6.0;
     const chiseledProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
-      chiseledProfile[i] = Math.pow(dist[i] / maxDist, 0.55);
+      const chamfer = Math.min(dist[i] / chamferW, 1.0);
+      const ridge = dist[i] / maxDist;
+      chiseledProfile[i] = chamfer * 0.70 + ridge * 0.30;
     }
 
-    // Gaussian smoothing removes step roughness while preserving the ridge line
-    const smoothProfile = gaussianFilter(chiseledProfile, w, h, sigma);
+    // Subtle smoothing removes pixel raster aliasing while keeping ridges razor sharp
+    const effectiveSigma = Math.min(sigma, 0.4);
+    const smoothProfile = (effectiveSigma > 0.05) ? gaussianFilter(chiseledProfile, w, h, effectiveSigma) : chiseledProfile;
 
     // Pad grid by 1 pixel for clean boundary sealing
     const paddedW = w + 2;
