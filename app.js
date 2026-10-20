@@ -1,7 +1,7 @@
 /**
  * GeminiSTL - 2D Image to Watertight 3D STL Mesh Generator
  * Features exact Euclidean Distance Transform (EDT), Gaussian smoothing,
- * watertight base/wall closure, Three.js 3D viewport, and binary STL export.
+ * connected component noise filtering, Three.js 3D viewport, and binary STL export.
  */
 
 // --- Euclidean Distance Transform (Felzenszwalb & Huttenlocher 1D/2D) ---
@@ -64,7 +64,6 @@ function distanceTransform(mask, w, h) {
     }
   }
 
-  // Normalize to [0, 1] if maxD > 0
   if (maxD > 0) {
     for (let i = 0; i < w * h; i++) dist[i] /= maxD;
   }
@@ -86,7 +85,6 @@ function gaussianFilter(arr, w, h, sigma) {
   for (let i = 0; i < kernelSize; i++) kernel[i] /= sum;
 
   const temp = new Float32Array(w * h);
-  // Horizontal pass
   for (let y = 0; y < h; y++) {
     const rowOffset = y * w;
     for (let x = 0; x < w; x++) {
@@ -100,7 +98,6 @@ function gaussianFilter(arr, w, h, sigma) {
   }
 
   const out = new Float32Array(w * h);
-  // Vertical pass
   for (let x = 0; x < w; x++) {
     for (let y = 0; y < h; y++) {
       let acc = 0;
@@ -112,6 +109,90 @@ function gaussianFilter(arr, w, h, sigma) {
     }
   }
   return out;
+}
+
+// Morphological closing (dilation followed by erosion) to seal internal crevices
+function binaryClosing(mask, w, h) {
+  const dilated = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const idx = row + x;
+      if (mask[idx]) {
+        dilated[idx] = 1;
+        if (x > 0) dilated[idx - 1] = 1;
+        if (x < w - 1) dilated[idx + 1] = 1;
+        if (y > 0) dilated[idx - w] = 1;
+        if (y < h - 1) dilated[idx + w] = 1;
+      }
+    }
+  }
+  const closed = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const idx = row + x;
+      if (dilated[idx] && dilated[idx - 1] && dilated[idx + 1] && dilated[idx - w] && dilated[idx + w]) {
+        closed[idx] = 1;
+      }
+    }
+  }
+  return closed;
+}
+
+// Connected Component noise filtering: removes floating debris, border vignettes, and background grunge
+function filterConnectedComponents(mask, w, h, data) {
+  const visited = new Uint8Array(w * h);
+  const cleanMask = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  const minSize = Math.max(40, Math.round((w * h) / 1500));
+
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const startIdx = y * w + x;
+      if (!mask[startIdx] || visited[startIdx]) continue;
+
+      let head = 0, tail = 0;
+      queue[tail++] = startIdx;
+      visited[startIdx] = 1;
+
+      let sumG = 0;
+      let sumLum = 0;
+      let touchesBorder = false;
+
+      while (head < tail) {
+        const cur = queue[head++];
+        const cx = cur % w;
+        const cy = Math.floor(cur / w);
+
+        if (cx <= 1 || cx >= w - 2 || cy <= 1 || cy >= h - 2) {
+          touchesBorder = true;
+        }
+
+        const p = cur * 4;
+        const r = data[p], g = data[p + 1], b = data[p + 2];
+        sumG += g;
+        sumLum += (0.299 * r + 0.587 * g + 0.114 * b);
+
+        if (cx > 0) { const n = cur - 1; if (mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+        if (cx < w - 1) { const n = cur + 1; if (mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+        if (cy > 0) { const n = cur - w; if (mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+        if (cy < h - 1) { const n = cur + w; if (mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
+      }
+
+      const compSize = tail;
+      const meanG = sumG / compSize;
+      const meanLum = sumLum / compSize;
+
+      // Keep substantial chrome/metallic parts; drop dark corner vignette and tiny background debris
+      if (compSize >= minSize && meanG > 20 && meanLum > 35 && !touchesBorder) {
+        for (let i = 0; i < tail; i++) {
+          cleanMask[queue[i]] = 1;
+        }
+      }
+    }
+  }
+  return cleanMask;
 }
 
 // --- App State & DOM Elements ---
@@ -186,7 +267,7 @@ function init3D() {
   const ambientLight = new THREE.AmbientLight(0xffffff, 0.45);
   scene.add(ambientLight);
 
-  const mainLight = new THREE.DirectionalLight(0xffffff, 0.9);
+  const mainLight = new THREE.DirectionalLight(0xffffff, 0.95);
   mainLight.position.set(100, 120, 200);
   mainLight.castShadow = true;
   scene.add(mainLight);
@@ -195,7 +276,7 @@ function init3D() {
   fillLight.position.set(-150, -100, 100);
   scene.add(fillLight);
 
-  const rimLight = new THREE.DirectionalLight(0xec4899, 0.4);
+  const rimLight = new THREE.DirectionalLight(0xec4899, 0.45);
   rimLight.position.set(0, 200, 50);
   scene.add(rimLight);
 
@@ -228,10 +309,10 @@ function animate() {
 
 function getActiveMaterial() {
   const matConfig = {
-    chrome: { color: 0xd8dde6, metalness: 0.88, roughness: 0.15, clearcoat: 0.3 },
+    chrome: { color: 0xd8dde6, metalness: 0.9, roughness: 0.15 },
     pink: { color: 0xec4899, metalness: 0.1, roughness: 0.4 },
     cyan: { color: 0x06b6d4, metalness: 0.2, roughness: 0.35 },
-    gold: { color: 0xf59e0b, metalness: 0.8, roughness: 0.25 },
+    gold: { color: 0xf59e0b, metalness: 0.85, roughness: 0.2 },
     clay: { color: 0xa8a29e, metalness: 0.0, roughness: 0.85 }
   };
   const cfg = matConfig[currentMaterialMode] || matConfig.chrome;
@@ -255,7 +336,6 @@ function loadImage(src, name) {
     dom.sourcePreview.src = img.src;
     updateMaskPreview();
     hideLoader();
-    // Auto-generate on first load
     setTimeout(build3DModel, 50);
   };
   img.onerror = () => {
@@ -266,7 +346,6 @@ function loadImage(src, name) {
 }
 
 function getMaskFromImage(img, maxSize) {
-  // Resize keeping aspect ratio
   let w = img.naturalWidth || img.width;
   let h = img.naturalHeight || img.height;
   if (w > maxSize || h > maxSize) {
@@ -287,7 +366,7 @@ function getMaskFromImage(img, maxSize) {
 
   const imgData = ctx.getImageData(0, 0, w, h);
   const data = imgData.data;
-  const mask = new Uint8Array(w * h);
+  const rawMask = new Uint8Array(w * h);
   const luminance = new Float32Array(w * h);
   const mode = dom.maskMode.value;
   const lumThresh = parseFloat(dom.lumThreshold.value) / 100;
@@ -303,8 +382,10 @@ function getMaskFromImage(img, maxSize) {
 
     let isForeground = false;
     if (mode === "tribal") {
-      // Chrome/silver and neon pink edges: higher G/B or bright luminance
-      isForeground = (g > 38) || (b > 45) || ((r > 210) && (g > 20));
+      // Rejection of dark red textured background:
+      // Background is characterized by high Red, very low Green (g < 35), and r > 1.8*g & r > 1.8*b.
+      const isBg = (r > 35) && (r > 1.8 * g) && (r > 1.8 * b) && (g < 35);
+      isForeground = !isBg;
     } else if (mode === "bright") {
       isForeground = lum >= lumThresh && a > 30;
     } else if (mode === "dark") {
@@ -312,10 +393,18 @@ function getMaskFromImage(img, maxSize) {
     } else if (mode === "alpha") {
       isForeground = a > 128;
     }
-    mask[p] = isForeground ? 1 : 0;
+    rawMask[p] = isForeground ? 1 : 0;
   }
 
-  return { w, h, mask, luminance, canvas };
+  let finalMask = rawMask;
+  if (mode === "tribal") {
+    // 1. Close gaps inside dark reflection bands
+    const closed = binaryClosing(rawMask, w, h);
+    // 2. Discard border vignette and tiny floating noise
+    finalMask = filterConnectedComponents(closed, w, h, data);
+  }
+
+  return { w, h, mask: finalMask, luminance, canvas };
 }
 
 function updateMaskPreview() {
@@ -347,7 +436,7 @@ function build3DModel() {
   if (!state.image) return;
 
   const startTime = performance.now();
-  showLoader("Generating 3D Watertight Geometry...");
+  showLoader("Sculpting Clean 3D Watertight Geometry...");
 
   setTimeout(() => {
     const maxSize = parseInt(dom.maxResolution.value, 10);
@@ -358,7 +447,7 @@ function build3DModel() {
 
     const { w, h, mask: rawMask, luminance } = getMaskFromImage(state.image, maxSize);
 
-    // Compute Distance Transform
+    // Compute Distance Transform on clean mask
     const dist = distanceTransform(rawMask, w, h);
 
     // Blend distance bevel (75%) with surface luminance shading (25%)
@@ -388,7 +477,6 @@ function build3DModel() {
     const scale = widthMm / paddedW;
     const vertices = [];
 
-    // Helper to push triangle
     function addTri(ax, ay, az, bx, by, bz, cx, cy, cz) {
       vertices.push(ax, ay, az, bx, by, bz, cx, cy, cz);
     }
@@ -403,7 +491,6 @@ function build3DModel() {
         if (mask[p00] || mask[p10] || mask[p01] || mask[p11]) {
           const x0 = c * scale;
           const x1 = (c + 1) * scale;
-          // Flip Y to match 3D space orientation
           const y0 = (paddedH - r) * scale;
           const y1 = (paddedH - (r + 1)) * scale;
 
@@ -418,7 +505,7 @@ function build3DModel() {
           addTri(x0, y0, 0,  x1, y0, 0,  x0, y1, 0);
           addTri(x1, y0, 0,  x1, y1, 0,  x0, y1, 0);
 
-          // Side walls wherever a cell transitions to background
+          // Watertight side walls
           // North boundary
           if (r === 0 || !mask[(r - 1) * paddedW + c]) {
             addTri(x0, y0, 0,  x0, y0, z00,  x1, y0, z10);
@@ -559,7 +646,6 @@ function downloadSTL() {
 
 // --- UI Event Listeners ---
 function setupEvents() {
-  // Slider displays
   dom.widthMm.addEventListener("input", e => {
     dom.widthMmVal.textContent = `${e.target.value} mm`;
   });
@@ -580,18 +666,15 @@ function setupEvents() {
     updateMaskPreview();
   });
 
-  // Mask mode selector
   dom.maskMode.addEventListener("change", e => {
     const val = e.target.value;
     dom.customMaskControls.style.display = (val === "bright" || val === "dark") ? "block" : "none";
     updateMaskPreview();
   });
 
-  // Generate and Download buttons
   dom.generateBtn.addEventListener("click", build3DModel);
   dom.downloadBtn.addEventListener("click", downloadSTL);
 
-  // File Upload
   dom.dropZone.addEventListener("click", () => dom.fileInput.click());
   dom.fileInput.addEventListener("change", e => {
     const file = e.target.files[0];
@@ -610,14 +693,12 @@ function setupEvents() {
     if (file && file.type.startsWith("image/")) handleImageFile(file);
   });
 
-  // Load Preset
   dom.loadPresetBtn.addEventListener("click", () => {
     dom.maskMode.value = "tribal";
     dom.customMaskControls.style.display = "none";
     loadImage("high_res.png", "tribal_heart.stl");
   });
 
-  // Preview Tabs
   document.querySelectorAll(".tab-btn").forEach(btn => {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
@@ -627,7 +708,6 @@ function setupEvents() {
     });
   });
 
-  // Viewport Toolbar Controls
   dom.resetCamBtn.addEventListener("click", () => {
     camera.position.set(0, -180, 160);
     controls.target.set(0, 0, 0);
@@ -664,10 +744,8 @@ function hideLoader() {
   dom.loaderOverlay.classList.add("hidden");
 }
 
-// Initialize on page load
 window.addEventListener("DOMContentLoaded", () => {
   init3D();
   setupEvents();
   loadImage("high_res.png", "tribal_heart.stl");
 });
-
