@@ -670,3 +670,4 @@ window.addEventListener("DOMContentLoaded", () => {
   setupEvents();
   loadImage("high_res.png", "tribal_heart.stl");
 });
+
