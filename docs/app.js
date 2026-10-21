@@ -177,7 +177,7 @@ function filterConnectedComponents(mask, w, h, data) {
       const meanG = sumG / compSize;
       const meanLum = sumLum / compSize;
 
-      if (compSize >= minSize && meanLum > 30 && (meanG > 15 || compSize > 400)) {
+      if (compSize >= minSize && meanLum > 35 && (meanG > 15 || compSize > 5000)) {
         for (let i = 0; i < tail; i++) {
           cleanMask[queue[i]] = 1;
         }
@@ -432,10 +432,29 @@ function getMaskFromImage(img, maxSize) {
   if (mode === "tribal") {
     // 1. Filter out corner vignette & isolated debris on raw mask
     const filtered = filterConnectedComponents(rawMask, w, h, data);
-    // 2. Heal small internal reflection voids while keeping genuine cutouts open
-    const filled = fillSmallHoles(filtered, w, h, 400);
-    // 3. 3-pass gentle closing to heal edge reflection notches completely (0 random gaps in topography)
-    finalMask = binaryClosing(filled, w, h, 3);
+
+    // Clear 3-pixel border to guarantee background connectivity around the model
+    for (let x = 0; x < w; x++) {
+      filtered[x] = 0; filtered[(h - 1) * w + x] = 0;
+      if (h > 2) { filtered[w + x] = 0; filtered[(h - 2) * w + x] = 0; }
+      if (h > 4) { filtered[2 * w + x] = 0; filtered[(h - 3) * w + x] = 0; }
+    }
+    for (let y = 0; y < h; y++) {
+      filtered[y * w] = 0; filtered[y * w + w - 1] = 0;
+      if (w > 2) { filtered[y * w + 1] = 0; filtered[y * w + w - 2] = 0; }
+      if (w > 4) { filtered[y * w + 2] = 0; filtered[y * w + w - 3] = 0; }
+    }
+
+    // 2. Heal small internal specular reflection voids while keeping the 4 genuine cutouts 100% OPEN!
+    const maxNoiseHole = Math.max(30, Math.round((w * h) / 2800));
+    const filled = fillSmallHoles(filtered, w, h, maxNoiseHole);
+
+    // 3. Level-set contour smoothing: turns jagged 1-2px raster staircases into silky smooth curves
+    const smoothFloat = gaussianFilter(filled, w, h, 1.8);
+    finalMask = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      finalMask[i] = smoothFloat[i] >= 0.5 ? 1 : 0;
+    }
   }
 
   return { w, h, mask: finalMask, canvas };
@@ -526,7 +545,8 @@ function build3DModel() {
         if (rawMask[rawIdx]) {
           mask[padIdx] = 1;
           const d = dist[rawIdx];
-          const edgeFeather = Math.min(d / 2.0, 1.0);
+          // Smooth continuous feathering over 4 pixels down to 0 at the knife edge
+          const edgeFeather = Math.pow(Math.min(d / 4.0, 1.0), 1.2);
           if (isDoubleSided) {
             Z[padIdx] = edgeFeather * smoothProfile[rawIdx] * halfH;
           } else {
@@ -538,10 +558,34 @@ function build3DModel() {
     }
 
     const scale = widthMm / paddedW;
-    const vertices = [];
+    const cx = (paddedW * scale) / 2;
+    const cy = (paddedH * scale) / 2;
 
-    function addTri(ax, ay, az, bx, by, bz, cx, cy, cz) {
-      vertices.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+    // Shared indexed vertices for smooth Gouraud/Phong shading & razor knife-edge closure
+    const topV = new Int32Array(paddedW * paddedH).fill(-1);
+    const botV = new Int32Array(paddedW * paddedH).fill(-1);
+    const positions = [];
+    const indices = [];
+
+    function getTopV(r, c, x, y, z) {
+      const p = r * paddedW + c;
+      if (topV[p] === -1) {
+        topV[p] = positions.length / 3;
+        positions.push(x - cx, y - cy, z);
+      }
+      return topV[p];
+    }
+
+    function getBotV(r, c, x, y, z) {
+      const p = r * paddedW + c;
+      if (Math.abs(z) < 1e-4 && topV[p] !== -1) {
+        return topV[p];
+      }
+      if (botV[p] === -1) {
+        botV[p] = positions.length / 3;
+        positions.push(x - cx, y - cy, -z);
+      }
+      return botV[p];
     }
 
     for (let r = 0; r < paddedH - 1; r++) {
@@ -562,75 +606,73 @@ function build3DModel() {
         const y0 = (paddedH - r) * scale;
         const y1 = (paddedH - (r + 1)) * scale;
 
+        const r0 = r, r1 = r + 1, c0 = c, c1 = c + 1;
+
         if (isDoubleSided) {
           // Adaptive diagonal split to avoid diagonal saddle line through zero
           if ((z01 === 0 && z10 === 0 && (z00 > 0 || z11 > 0)) || Math.abs(z00 - z11) < Math.abs(z01 - z10)) {
             // Tri 1: (00, 01, 11)
             if (!(z00 === 0 && z01 === 0 && z11 === 0)) {
-              addTri(x0, y0, z00,   x0, y1, z01,   x1, y1, z11);
-              addTri(x0, y0, -z00,  x1, y1, -z11,  x0, y1, -z01);
+              indices.push(getTopV(r0, c0, x0, y0, z00), getTopV(r1, c0, x0, y1, z01), getTopV(r1, c1, x1, y1, z11));
+              indices.push(getBotV(r0, c0, x0, y0, z00), getBotV(r1, c1, x1, y1, z11), getBotV(r1, c0, x0, y1, z01));
             }
             // Tri 2: (00, 11, 10)
             if (!(z00 === 0 && z11 === 0 && z10 === 0)) {
-              addTri(x0, y0, z00,   x1, y1, z11,   x1, y0, z10);
-              addTri(x0, y0, -z00,  x1, y0, -z10,  x1, y1, -z11);
+              indices.push(getTopV(r0, c0, x0, y0, z00), getTopV(r1, c1, x1, y1, z11), getTopV(r0, c1, x1, y0, z10));
+              indices.push(getBotV(r0, c0, x0, y0, z00), getBotV(r0, c1, x1, y0, z10), getBotV(r1, c1, x1, y1, z11));
             }
           } else {
             // Tri 1: (00, 01, 10)
             if (!(z00 === 0 && z01 === 0 && z10 === 0)) {
-              addTri(x0, y0, z00,   x0, y1, z01,   x1, y0, z10);
-              addTri(x0, y0, -z00,  x1, y0, -z10,  x0, y1, -z01);
+              indices.push(getTopV(r0, c0, x0, y0, z00), getTopV(r1, c0, x0, y1, z01), getTopV(r0, c1, x1, y0, z10));
+              indices.push(getBotV(r0, c0, x0, y0, z00), getBotV(r0, c1, x1, y0, z10), getBotV(r1, c0, x0, y1, z01));
             }
             // Tri 2: (10, 01, 11)
             if (!(z10 === 0 && z01 === 0 && z11 === 0)) {
-              addTri(x1, y0, z10,   x0, y1, z01,   x1, y1, z11);
-              addTri(x1, y0, -z10,  x1, y1, -z11,  x0, y1, -z01);
+              indices.push(getTopV(r0, c1, x1, y0, z10), getTopV(r1, c0, x0, y1, z01), getTopV(r1, c1, x1, y1, z11));
+              indices.push(getBotV(r0, c1, x1, y0, z10), getBotV(r1, c1, x1, y1, z11), getBotV(r1, c0, x0, y1, z01));
             }
           }
         } else {
-          // Top sculpted surface (+Z)
-          addTri(x0, y0, z00,  x0, y1, z01,  x1, y0, z10);
-          addTri(x1, y0, z10,  x0, y1, z01,  x1, y1, z11);
+          // Single-sided mode
+          const v00 = getTopV(r0, c0, x0, y0, z00);
+          const v10 = getTopV(r0, c1, x1, y0, z10);
+          const v01 = getTopV(r1, c0, x0, y1, z01);
+          const v11 = getTopV(r1, c1, x1, y1, z11);
+          indices.push(v00, v01, v10);
+          indices.push(v10, v01, v11);
 
-          // Flat bottom surface (Z=0)
-          addTri(x0, y0, 0,  x1, y0, 0,  x0, y1, 0);
-          addTri(x1, y0, 0,  x1, y1, 0,  x0, y1, 0);
+          const b00 = getBotV(r0, c0, x0, y0, 0);
+          const b10 = getBotV(r0, c1, x1, y0, 0);
+          const b01 = getBotV(r1, c0, x0, y1, 0);
+          const b11 = getBotV(r1, c1, x1, y1, 0);
+          indices.push(b00, b10, b01);
+          indices.push(b10, b11, b01);
 
-            // Watertight vertical boundary walls (single-sided mode)
-            if (r === 0 || !mask[(r - 1) * paddedW + c]) {
-              addTri(x0, y0, 0,  x0, y0, z00,  x1, y0, z10);
-              addTri(x0, y0, 0,  x1, y0, z10,  x1, y0, 0);
-            }
-            if (r === paddedH - 2 || !mask[(r + 1) * paddedW + c]) {
-              addTri(x0, y1, 0,  x1, y1, z11,  x0, y1, z01);
-              addTri(x0, y1, 0,  x1, y1, 0,    x1, y1, z11);
-            }
-            if (c === 0 || !mask[r * paddedW + (c - 1)]) {
-              addTri(x0, y0, 0,  x0, y1, z01,  x0, y0, z00);
-              addTri(x0, y0, 0,  x0, y1, 0,    x0, y1, z01);
-            }
-            if (c === paddedW - 2 || !mask[r * paddedW + (c + 1)]) {
-              addTri(x1, y0, 0,  x1, y0, z10,  x1, y1, z11);
-              addTri(x1, y0, 0,  x1, y1, z11,  x1, y1, 0);
-            }
+          if (r === 0 || !mask[(r - 1) * paddedW + c]) {
+            indices.push(b00, v00, v10); indices.push(b00, v10, b10);
+          }
+          if (r === paddedH - 2 || !mask[(r + 1) * paddedW + c]) {
+            indices.push(b01, v11, v01); indices.push(b01, b11, v11);
+          }
+          if (c === 0 || !mask[r * paddedW + (c - 1)]) {
+            indices.push(b00, v01, v00); indices.push(b00, b01, v01);
+          }
+          if (c === paddedW - 2 || !mask[r * paddedW + (c + 1)]) {
+            indices.push(b10, v10, v11); indices.push(b10, v11, b11);
           }
         }
       }
-
-    const vertexFloatArray = new Float32Array(vertices);
-    const numTriangles = vertices.length / 9;
-
-    // Center mesh around origin
-    const cx = (paddedW * scale) / 2;
-    const cy = (paddedH * scale) / 2;
-    for (let i = 0; i < vertexFloatArray.length; i += 3) {
-      vertexFloatArray[i] -= cx;
-      vertexFloatArray[i + 1] -= cy;
     }
 
-    // Three.js BufferGeometry
+    const positionFloatArray = new Float32Array(positions);
+    const indexUintArray = positions.length / 3 > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
+    const numTriangles = indices.length / 3;
+
+    // Three.js BufferGeometry with shared vertices & smooth vertex normals
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(vertexFloatArray, 3));
+    geometry.setAttribute("position", new THREE.BufferAttribute(positionFloatArray, 3));
+    geometry.setIndex(new THREE.BufferAttribute(indexUintArray, 1));
     geometry.computeVertexNormals();
 
     while (meshGroup.children.length > 0) {
@@ -647,7 +689,7 @@ function build3DModel() {
     const lengthY = (paddedH * scale).toFixed(1);
     const heightZ = (baseThickness + bevelHeight).toFixed(1);
 
-    state.stlBlob = createBinarySTL(vertexFloatArray, numTriangles);
+    state.stlBlob = createBinarySTL(positionFloatArray, indexUintArray);
     dom.downloadBtn.disabled = false;
 
     const elapsed = Math.round(performance.now() - startTime);
@@ -659,8 +701,9 @@ function build3DModel() {
   }, 30);
 }
 
-// --- Binary STL Exporter ---
-function createBinarySTL(vertices, numTriangles) {
+// --- Binary STL Exporter (Indexed Mesh) ---
+function createBinarySTL(positions, indices) {
+  const numTriangles = indices.length / 3;
   const bufferSize = 84 + numTriangles * 50;
   const buffer = new ArrayBuffer(bufferSize);
   const view = new DataView(buffer);
@@ -674,10 +717,10 @@ function createBinarySTL(vertices, numTriangles) {
 
   let offset = 84;
   for (let t = 0; t < numTriangles; t++) {
-    const vIdx = t * 9;
-    const ax = vertices[vIdx],     ay = vertices[vIdx + 1], az = vertices[vIdx + 2];
-    const bx = vertices[vIdx + 3], by = vertices[vIdx + 4], bz = vertices[vIdx + 5];
-    const cx = vertices[vIdx + 6], cy = vertices[vIdx + 7], cz = vertices[vIdx + 8];
+    const i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2];
+    const ax = positions[i0 * 3], ay = positions[i0 * 3 + 1], az = positions[i0 * 3 + 2];
+    const bx = positions[i1 * 3], by = positions[i1 * 3 + 1], bz = positions[i1 * 3 + 2];
+    const cx = positions[i2 * 3], cy = positions[i2 * 3 + 1], cz = positions[i2 * 3 + 2];
 
     const abx = bx - ax, aby = by - ay, abz = bz - az;
     const acx = cx - ax, acy = cy - ay, acz = cz - az;
