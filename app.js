@@ -454,14 +454,14 @@ function getMaskFromImage(img, maxSize) {
     const maxNoiseHole = Math.max(30, Math.round((w * h) / 2800));
     const filled = fillSmallHoles(filtered, w, h, maxNoiseHole);
 
-    // 3. Level-set contour smoothing: turns jagged 1-2px raster staircases into silky smooth curves
-    smoothFloat = gaussianFilter(filled, w, h, 1.8);
+    // 3. Level-set contour smoothing: turns jagged raster staircases into silky smooth CAD curves
+    smoothFloat = gaussianFilter(filled, w, h, 2.5);
     finalMask = new Uint8Array(w * h);
     for (let i = 0; i < w * h; i++) {
       finalMask[i] = smoothFloat[i] >= 0.5 ? 1 : 0;
     }
   } else {
-    smoothFloat = gaussianFilter(finalMask, w, h, 1.2);
+    smoothFloat = gaussianFilter(finalMask, w, h, 2.0);
   }
 
   return { w, h, mask: finalMask, smoothFloat, canvas };
@@ -510,86 +510,72 @@ function build3DModel() {
     const ctx = canvas.getContext("2d");
     const imgData = ctx.getImageData(0, 0, w, h).data;
 
-    // Sub-pixel Level-Set gradient projection: eliminates the 90-degree integer raster staircasing
-    const shiftX = new Float32Array(w * h);
-    const shiftY = new Float32Array(w * h);
-    if (smoothFloat) {
-      for (let r = 0; r < h; r++) {
-        for (let c = 0; c < w; c++) {
-          const idx = r * w + c;
-          const val = smoothFloat[idx];
-          if (val >= 0.08 && val <= 0.92) {
-            const cL = c > 0 ? c - 1 : c;
-            const cR = c < w - 1 ? c + 1 : c;
-            const rU = r > 0 ? r - 1 : r;
-            const rD = r < h - 1 ? r + 1 : r;
-            const gx = (smoothFloat[r * w + cR] - smoothFloat[r * w + cL]) * 0.5;
-            const gy = (smoothFloat[rD * w + c] - smoothFloat[rU * w + c]) * 0.5;
-            const g2 = gx * gx + gy * gy + 1e-6;
-            const factor = (0.5 - val) / g2;
-            shiftX[idx] = Math.max(-0.85, Math.min(0.85, factor * gx));
-            shiftY[idx] = Math.max(-0.85, Math.min(0.85, factor * gy));
-          }
-        }
-      }
-    }
+    // 1. Distance transform with Gaussian filter (eliminates discrete Voronoi grid ripples)
+    const rawDist = distanceTransform(rawMask, w, h);
+    const dist = gaussianFilter(rawDist, w, h, 2.0);
 
-    // Compute exact Euclidean Distance Transform
-    const dist = distanceTransform(rawMask, w, h);
-
-    // Multi-scale Chiseled Blade Sculpting:
-    // Local 45-degree chamfer (8px) + aerodynamic blade roof + unsharp-masked metallic chrome relief
+    // 2. Pure, Noise-Free CAD Blade Sculpting:
+    // 55% smooth 45-degree chamfer bevel + 40% continuous exponential blade roof + 5% subtle smooth tone
+    // ZERO photographic grain / ZERO orange-peel ripples
     const lumArray = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       const p = i * 4;
       lumArray[i] = (0.299 * imgData[p] + 0.587 * imgData[p + 1] + 0.114 * imgData[p + 2]) / 255.0;
     }
-    const lumBase = gaussianFilter(lumArray, w, h, 0.8);
-    const lumCoarse = gaussianFilter(lumArray, w, h, 3.5);
+    const lumClean = gaussianFilter(lumArray, w, h, 4.0);
 
     const rawProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       if (!rawMask[i]) continue;
       const d = dist[i];
-      const chamfer = Math.min(d / 8.0, 1.0);
+      const tChamf = Math.min(d / 12.0, 1.0);
+      const chamfer = tChamf * tChamf * (3.0 - 2.0 * tChamf);
       const bladeRoof = 1.0 - Math.exp(-d / 8.0);
+      const lumRelief = Math.max(0, Math.min(1.0, (lumClean[i] - 0.15) / 0.85));
 
-      const lumDetail = lumArray[i] - lumCoarse[i];
-      const chiseledLum = Math.max(0, Math.min(1.0, lumBase[i] + 1.2 * lumDetail));
-      const lumRelief = Math.max(0, Math.min(1.0, (chiseledLum - 0.12) / 0.88));
-
-      rawProfile[i] = (chamfer * 0.30) + (bladeRoof * 0.30) + (lumRelief * 0.40);
+      rawProfile[i] = (chamfer * 0.55) + (bladeRoof * 0.40) + (lumRelief * 0.05);
     }
 
-    const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma) : rawProfile;
+    const smoothProfile = gaussianFilter(rawProfile, w, h, Math.max(sigma, 1.0));
+
+    // 3. Compute continuous raw heightfield with cubic Hermite edge feathering
+    const rawZ = new Float32Array(w * h);
+    const halfH = isDoubleSided ? ((baseThickness + bevelHeight) / 2.0) : bevelHeight;
+
+    for (let i = 0; i < w * h; i++) {
+      if (rawMask[i]) {
+        const d = dist[i];
+        const t = Math.min(d / 5.0, 1.0);
+        const edgeFeather = t * t * (3.0 - 2.0 * t);
+        const alpha = smoothFloat ? Math.max(0, Math.min(1.0, smoothFloat[i] * 2.5 - 0.75)) : 1.0;
+        if (isDoubleSided) {
+          rawZ[i] = edgeFeather * smoothProfile[i] * halfH * alpha;
+        } else {
+          const baseTaper = Math.min(d / 4.0, 1.0);
+          rawZ[i] = (baseTaper * baseThickness) + (smoothProfile[i] * bevelHeight * alpha);
+        }
+      }
+    }
+
+    // 4. Global surface relaxation filter: guarantees glass-smooth C2 continuity across entire mesh
+    const relaxedZ = gaussianFilter(rawZ, w, h, 1.2);
+    for (let i = 0; i < w * h; i++) {
+      if (!rawMask[i]) relaxedZ[i] = 0;
+    }
 
     // Pad grid by 1 pixel for clean boundary sealing
     const paddedW = w + 2;
     const paddedH = h + 2;
     const Z = new Float32Array(paddedW * paddedH);
-    const padShiftX = new Float32Array(paddedW * paddedH);
-    const padShiftY = new Float32Array(paddedW * paddedH);
     const mask = new Uint8Array(paddedW * paddedH);
-
-    const halfH = isDoubleSided ? ((baseThickness + bevelHeight) / 2.0) : bevelHeight;
 
     for (let r = 0; r < h; r++) {
       for (let c = 0; c < w; c++) {
         const rawIdx = r * w + c;
         const padIdx = (r + 1) * paddedW + (c + 1);
-        padShiftX[padIdx] = shiftX[rawIdx];
-        padShiftY[padIdx] = shiftY[rawIdx];
         if (rawMask[rawIdx]) {
           mask[padIdx] = 1;
-          const d = dist[rawIdx];
-          const edgeFeather = Math.pow(Math.min(d / 3.0, 1.0), 1.1);
-          const alpha = smoothFloat ? Math.max(0, Math.min(1.0, smoothFloat[rawIdx] * 2.0 - 0.5)) : 1.0;
-          if (isDoubleSided) {
-            Z[padIdx] = edgeFeather * smoothProfile[rawIdx] * halfH * alpha;
-          } else {
-            const baseTaper = Math.min(d / 4.0, 1.0);
-            Z[padIdx] = (baseTaper * baseThickness) + (smoothProfile[rawIdx] * bevelHeight * alpha);
-          }
+          Z[padIdx] = relaxedZ[rawIdx];
         }
       }
     }
@@ -608,9 +594,7 @@ function build3DModel() {
       const p = r * paddedW + c;
       if (topV[p] === -1) {
         topV[p] = positions.length / 3;
-        const x = (c + padShiftX[p]) * scale;
-        const y = (paddedH - (r + padShiftY[p])) * scale;
-        positions.push(x - cx, y - cy, z);
+        positions.push(c * scale - cx, (paddedH - r) * scale - cy, z);
       }
       return topV[p];
     }
@@ -622,9 +606,7 @@ function build3DModel() {
       }
       if (botV[p] === -1) {
         botV[p] = positions.length / 3;
-        const x = (c + padShiftX[p]) * scale;
-        const y = (paddedH - (r + padShiftY[p])) * scale;
-        positions.push(x - cx, y - cy, -z);
+        positions.push(c * scale - cx, (paddedH - r) * scale - cy, -z);
       }
       return botV[p];
     }

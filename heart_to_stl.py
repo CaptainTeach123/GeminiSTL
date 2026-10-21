@@ -12,7 +12,7 @@ from stl import mesh
 def create_heart_stl(
     image_path="high_res.png",
     output_stl="tribal_heart.stl",
-    max_size=750,          # High resolution for razor-sharp curves and smooth edges
+    max_size=800,          # High resolution for silky smooth CAD curves
     width_mm=120.0,        # Physical width of the 3D print in millimeters
     base_thickness=3.0,    # Base thickness / center band in mm
     bevel_height=4.5,      # Sculpted bevel / blade ridge height in mm
@@ -49,7 +49,6 @@ def create_heart_stl(
         comp_lum = lum[lbl == i].mean()
         comp_g = G[lbl == i].mean()
         comp_b = B[lbl == i].mean()
-        # Corner vignette is near pitch-black (lum < 0.08, G < 10). Metal heart features have silver/chrome color
         if comp_lum > 0.12 and (comp_g > 15 or comp_b > 25 or sizes[i] > 1000):
             clean_mask |= (lbl == i)
             
@@ -69,63 +68,55 @@ def create_heart_stl(
         if h_sizes[i] < 120:
             filled_mask |= (lbl_h == i)
             
-    # 4. Continuous Level-Set contour field
-    smooth_float = gaussian_filter(filled_mask.astype(np.float32), sigma=1.8)
+    # 4. Continuous Level-Set contour field (sigma=2.5 for silky smooth CAD curves)
+    smooth_float = gaussian_filter(filled_mask.astype(np.float32), sigma=2.5)
     mask_grid = (smooth_float >= 0.5)
     
-    # 5. Sub-pixel Level-Set gradient projection: eliminates the 90-degree integer raster staircasing
-    gy, gx = np.gradient(smooth_float)
-    grad_sq = gx**2 + gy**2 + 1e-6
-    shift_x = np.clip((0.5 - smooth_float) * gx / grad_sq, -0.85, 0.85)
-    shift_y = np.clip((0.5 - smooth_float) * gy / grad_sq, -0.85, 0.85)
-    near_bnd = (smooth_float >= 0.08) & (smooth_float <= 0.92)
-    shift_x = np.where(near_bnd, shift_x, 0.0)
-    shift_y = np.where(near_bnd, shift_y, 0.0)
+    print(f"Generating {'double-sided' if double_sided else 'single-sided'} silky smooth 3D CAD geometry on {target_w}x{target_h} grid...")
     
-    print(f"Generating {'double-sided' if double_sided else 'single-sided'} 3D sculpted geometry on {target_w}x{target_h} grid...")
-    
-    # 6. Distance transform & Multi-scale Chiseled Blade Sculpting
-    dist = distance_transform_edt(mask_grid)
+    # 5. Distance transform with Gaussian smoothing (eliminates Voronoi discrete grid ripples)
+    raw_dist = distance_transform_edt(mask_grid)
+    dist = gaussian_filter(raw_dist, sigma=2.0)
     d_max = dist.max() + 1e-5
     
-    # Knife-edge feather ramp: drops smoothly to zero at perimeter
-    edge_feather = np.clip(dist / 3.0, 0.0, 1.0) ** 1.1
-    alpha = np.clip(smooth_float * 2.0 - 0.5, 0.0, 1.0)
+    # Smooth Hermite knife-edge feathering (zero slope at perimeter knife edge: zero edge cliff)
+    t = np.clip(dist / 5.0, 0.0, 1.0)
+    edge_feather = t * t * (3.0 - 2.0 * t)
     
-    # Local 45-degree chamfer bevel (steep knife edge)
-    chamfer = np.clip(dist / 8.0, 0.0, 1.0)
+    # Pure, noise-free CAD blade sculpting:
+    # 55% smooth 45-degree chamfer bevel + 40% aerodynamic blade roof + 5% subtle smooth tone
+    # ZERO photographic noise / ZERO orange-peel ripples
+    chamfer = np.clip(dist / 12.0, 0.0, 1.0)
+    chamfer = chamfer * chamfer * (3.0 - 2.0 * chamfer)
     
-    # Aerodynamic continuous blade roof (ensures narrow spikes reach proud height)
     blade_roof = 1.0 - np.exp(-dist / 8.0)
     
-    # Unsharp-masked chrome relief: preserves high-frequency grooves & reflection crests
-    lum_base = gaussian_filter(lum, sigma=0.8)
-    lum_detail = lum - gaussian_filter(lum, sigma=3.5)
-    chiseled_lum = np.clip(lum_base + 1.2 * lum_detail, 0.0, 1.0)
-    lum_relief = np.clip((chiseled_lum - 0.12) / 0.88, 0.0, 1.0) * mask_grid
+    lum_clean = gaussian_filter(lum, sigma=4.0)
+    lum_relief = np.clip((lum_clean - 0.15) / 0.85, 0.0, 1.0) * mask_grid
     
-    # Composite sculpted topography
-    sculpted = (chamfer * 0.30) + (blade_roof * 0.30) + (lum_relief * 0.40)
-    sculpted = gaussian_filter(sculpted, sigma=0.3)
+    sculpted = (chamfer * 0.55) + (blade_roof * 0.40) + (lum_relief * 0.05)
     
     half_h = (base_thickness + bevel_height) / 2.0 if double_sided else bevel_height
+    alpha = np.clip(smooth_float * 2.5 - 0.75, 0.0, 1.0)
+    
     if double_sided:
         Z = np.where(mask_grid, edge_feather * sculpted * half_h * alpha, 0.0)
     else:
         base_taper = np.clip(dist / 4.0, 0.0, 1.0)
         Z = np.where(mask_grid, (base_taper * base_thickness) + (sculpted * bevel_height * alpha), 0.0)
         
+    # Global surface relaxation filter: guarantees glass-smooth C2 continuity across entire mesh
+    Z = gaussian_filter(Z, sigma=1.2) * mask_grid
+    
     # Pad edges with zeros so geometry closes cleanly
     Z = np.pad(Z, pad_width=1, mode="constant", constant_values=0.0)
-    shift_x = np.pad(shift_x, pad_width=1, mode="constant", constant_values=0.0)
-    shift_y = np.pad(shift_y, pad_width=1, mode="constant", constant_values=0.0)
     mask_grid = Z > 0
     
     H, W = Z.shape
     scale = width_mm / W
     
     faces = []
-    print("Building watertight 3D solid mesh with smooth subpixel boundary alignment...")
+    print("Building watertight 3D solid mesh with silky smooth CAD surface...")
     
     for r in range(H - 1):
         for c in range(W - 1):
@@ -136,61 +127,51 @@ def create_heart_stl(
             if z00 == 0 and z10 == 0 and z01 == 0 and z11 == 0:
                 continue
                 
-            # Subpixel level-set vertex positions
-            x00 = (c + shift_x[r, c]) * scale
-            y00 = (H - (r + shift_y[r, c])) * scale
-            
-            x10 = (c + 1 + shift_x[r, c+1]) * scale
-            y10 = (H - (r + shift_y[r, c+1])) * scale
-            
-            x01 = (c + shift_x[r+1, c]) * scale
-            y01 = (H - (r + 1 + shift_y[r+1, c])) * scale
-            
-            x11 = (c + 1 + shift_x[r+1, c+1]) * scale
-            y11 = (H - (r + 1 + shift_y[r+1, c+1])) * scale
+            x0, x1 = c * scale, (c + 1) * scale
+            y0, y1 = (H - r) * scale, (H - (r + 1)) * scale
             
             if double_sided:
                 # Adaptive diagonal split to avoid diagonal saddle line through zero
                 if (z01 == 0 and z10 == 0 and (z00 > 0 or z11 > 0)) or abs(z00 - z11) < abs(z01 - z10):
                     # Tri 1: (00, 01, 11)
                     if not (z00 == 0 and z01 == 0 and z11 == 0):
-                        faces.append([[x00, y00, z00], [x01, y01, z01], [x11, y11, z11]])
-                        faces.append([[x00, y00, -z00], [x11, y11, -z11], [x01, y01, -z01]])
+                        faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y1, z11]])
+                        faces.append([[x0, y0, -z00], [x1, y1, -z11], [x0, y1, -z01]])
                     # Tri 2: (00, 11, 10)
                     if not (z00 == 0 and z11 == 0 and z10 == 0):
-                        faces.append([[x00, y00, z00], [x11, y11, z11], [x10, y10, z10]])
-                        faces.append([[x00, y00, -z00], [x10, y10, -z10], [x11, y11, -z11]])
+                        faces.append([[x0, y0, z00], [x1, y1, z11], [x1, y0, z10]])
+                        faces.append([[x0, y0, -z00], [x1, y0, -z10], [x1, y1, -z11]])
                 else:
                     # Tri 1: (00, 01, 10)
                     if not (z00 == 0 and z01 == 0 and z10 == 0):
-                        faces.append([[x00, y00, z00], [x01, y01, z01], [x10, y10, z10]])
-                        faces.append([[x00, y00, -z00], [x10, y10, -z10], [x01, y01, -z01]])
+                        faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y0, z10]])
+                        faces.append([[x0, y0, -z00], [x1, y0, -z10], [x0, y1, -z01]])
                     # Tri 2: (10, 01, 11)
                     if not (z10 == 0 and z01 == 0 and z11 == 0):
-                        faces.append([[x10, y10, z10], [x01, y01, z01], [x11, y11, z11]])
-                        faces.append([[x10, y10, -z10], [x11, y11, -z11], [x01, y01, -z01]])
+                        faces.append([[x1, y0, z10], [x0, y1, z01], [x1, y1, z11]])
+                        faces.append([[x1, y0, -z10], [x1, y1, -z11], [x0, y1, -z01]])
             else:
                 # Top sculpted surface (+Z)
-                faces.append([[x00, y00, z00], [x01, y01, z01], [x10, y10, z10]])
-                faces.append([[x10, y10, z10], [x01, y01, z01], [x11, y11, z11]])
+                faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y0, z10]])
+                faces.append([[x1, y0, z10], [x0, y1, z01], [x1, y1, z11]])
                 
                 # Flat bottom surface (Z=0)
-                faces.append([[x00, y00, 0], [x10, y10, 0], [x01, y01, 0]])
-                faces.append([[x10, y10, 0], [x11, y11, 0], [x01, y01, 0]])
+                faces.append([[x0, y0, 0], [x1, y0, 0], [x0, y1, 0]])
+                faces.append([[x1, y0, 0], [x1, y1, 0], [x0, y1, 0]])
                 
                 # Side walls (single-sided mode)
                 if r == 0 or not mask_grid[r-1, c]:
-                    faces.append([[x00, y00, 0], [x00, y00, z00], [x10, y10, z10]])
-                    faces.append([[x00, y00, 0], [x10, y10, z10], [x10, y10, 0]])
+                    faces.append([[x0, y0, 0], [x0, y0, z00], [x1, y0, z10]])
+                    faces.append([[x0, y0, 0], [x1, y0, z10], [x1, y0, 0]])
                 if r == H - 2 or not mask_grid[r+1, c]:
-                    faces.append([[x01, y01, 0], [x11, y11, z11], [x01, y01, z01]])
-                    faces.append([[x01, y01, 0], [x11, y11, 0], [x11, y11, z11]])
+                    faces.append([[x0, y1, 0], [x1, y1, z11], [x0, y1, z01]])
+                    faces.append([[x0, y1, 0], [x1, y1, 0], [x1, y1, z11]])
                 if c == 0 or not mask_grid[r, c-1]:
-                    faces.append([[x00, y00, 0], [x01, y01, z01], [x00, y00, z00]])
-                    faces.append([[x00, y00, 0], [x01, y01, 0], [x01, y01, z01]])
+                    faces.append([[x0, y0, 0], [x0, y1, z01], [x0, y0, z00]])
+                    faces.append([[x0, y0, 0], [x0, y1, 0], [x0, y1, z01]])
                 if c == W - 2 or not mask_grid[r, c+1]:
-                    faces.append([[x10, y10, 0], [x10, y10, z10], [x11, y11, z11]])
-                    faces.append([[x10, y10, 0], [x11, y11, z11], [x11, y11, 0]])
+                    faces.append([[x1, y0, 0], [x1, y0, z10], [x1, y1, z11]])
+                    faces.append([[x1, y0, 0], [x1, y1, z11], [x1, y1, 0]])
 
     faces_arr = np.array(faces, dtype=np.float32)
     heart_mesh = mesh.Mesh(np.zeros(faces_arr.shape[0], dtype=mesh.Mesh.dtype))
