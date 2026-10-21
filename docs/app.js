@@ -514,162 +514,188 @@ function build3DModel() {
     const rawDist = distanceTransform(rawMask, w, h);
     const dist = gaussianFilter(rawDist, w, h, 1.5);
 
-    // 2. Pure Geometric CAD Blade Sculpting (ZERO photographic glare distortion):
-    // Smooth 45-degree chamfer bevel rising over 14 pixels with C1 smoothstep continuity
-    const rawProfile = new Float32Array(w * h);
-    for (let i = 0; i < w * h; i++) {
-      if (!rawMask[i]) continue;
-      const d = dist[i];
-      const tChamf = Math.min(d / 14.0, 1.0);
-      const chamfer = tChamf * tChamf * (3.0 - 2.0 * tChamf);
-      const bladeRoof = 1.0 - Math.exp(-d / 8.0);
-
-      rawProfile[i] = (chamfer * 0.60) + (bladeRoof * 0.40);
-    }
-
-    const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma) : rawProfile;
-
-    // 3. Compute continuous raw heightfield with cubic Hermite edge feathering
-    // Eliminates vertical edge cliffs and serrated teeth
-    const rawZ = new Float32Array(w * h);
+    // 2. Pure Geometric CAD Blade Sculpting:
+    // Continuous sinusoidal chamfer bevel rising cleanly from perimeter knife-edge (d=0, Z=0)
+    // Zero flat brim/flange, zero artificial feathering
+    const Z = new Float32Array(w * h);
     const halfH = isDoubleSided ? ((baseThickness + bevelHeight) / 2.0) : bevelHeight;
 
     for (let i = 0; i < w * h; i++) {
-      if (rawMask[i]) {
-        const alpha = smoothFloat ? Math.max(0, Math.min(1.0, smoothFloat[i] * 2.0 - 1.0)) : 1.0;
-        const alphaSmooth = alpha * alpha * (3.0 - 2.0 * alpha);
-        if (isDoubleSided) {
-          rawZ[i] = smoothProfile[i] * halfH * alphaSmooth;
-        } else {
-          const baseTaper = Math.min(dist[i] / 4.0, 1.0);
-          rawZ[i] = (baseTaper * baseThickness) + (smoothProfile[i] * bevelHeight * alphaSmooth);
+      if (!rawMask[i]) continue;
+      const d = dist[i];
+      const tBevel = Math.min(d / 14.0, 1.0);
+      const bevelProfile = Math.sin(tBevel * (Math.PI / 2.0));
+      const bladeRoof = 1.0 - Math.exp(-d / 8.0);
+      const sculpted = (bevelProfile * 0.70) + (bladeRoof * 0.30);
+      if (isDoubleSided) {
+        Z[i] = sculpted * halfH;
+      } else {
+        const baseTaper = Math.min(d / 4.0, 1.0);
+        Z[i] = (baseTaper * baseThickness) + (sculpted * bevelHeight);
+      }
+    }
+
+    // 3. Sub-pixel Marching Squares edge crossings
+    const hCross = new Float32Array(h * (w - 1)).fill(-1);
+    for (let y = 0; y < h; y++) {
+      const rowOffset = y * w;
+      const hOffset = y * (w - 1);
+      for (let x = 0; x < w - 1; x++) {
+        const v0 = smoothFloat[rowOffset + x], v1 = smoothFloat[rowOffset + x + 1];
+        if ((v0 >= 0.5) !== (v1 >= 0.5)) {
+          const t = Math.max(0.0001, Math.min(0.9999, (0.5 - v0) / (v1 - v0 + 1e-12)));
+          hCross[hOffset + x] = x + t;
         }
       }
     }
 
-    // 4. Global surface relaxation filter: guarantees glass-smooth C2 continuity across entire mesh
-    const relaxedZ = gaussianFilter(rawZ, w, h, 1.0);
-    for (let i = 0; i < w * h; i++) {
-      if (!rawMask[i] || relaxedZ[i] < 1e-4) relaxedZ[i] = 0;
-    }
-
-    // Pad grid by 1 pixel for clean boundary sealing
-    const paddedW = w + 2;
-    const paddedH = h + 2;
-    const Z = new Float32Array(paddedW * paddedH);
-    const mask = new Uint8Array(paddedW * paddedH);
-
-    for (let r = 0; r < h; r++) {
-      for (let c = 0; c < w; c++) {
-        const rawIdx = r * w + c;
-        const padIdx = (r + 1) * paddedW + (c + 1);
-        if (rawMask[rawIdx]) {
-          mask[padIdx] = 1;
-          Z[padIdx] = relaxedZ[rawIdx];
+    const vCross = new Float32Array((h - 1) * w).fill(-1);
+    for (let y = 0; y < h - 1; y++) {
+      const row0 = y * w, row1 = (y + 1) * w;
+      for (let x = 0; x < w; x++) {
+        const v0 = smoothFloat[row0 + x], v1 = smoothFloat[row1 + x];
+        if ((v0 >= 0.5) !== (v1 >= 0.5)) {
+          const t = Math.max(0.0001, Math.min(0.9999, (0.5 - v0) / (v1 - v0 + 1e-12)));
+          vCross[row0 + x] = y + t;
         }
       }
     }
 
-    const scale = widthMm / paddedW;
-    const cx = (paddedW * scale) / 2;
-    const cy = (paddedH * scale) / 2;
+    const scale = widthMm / w;
+    const cx = (w * scale) / 2;
+    const cy = (h * scale) / 2;
 
-    // Shared indexed vertices for smooth Gouraud/Phong shading & razor knife-edge closure
-    const topV = new Int32Array(paddedW * paddedH).fill(-1);
-    const botV = new Int32Array(paddedW * paddedH).fill(-1);
+    const topGridV = new Int32Array(w * h).fill(-1);
+    const botGridV = new Int32Array(w * h).fill(-1);
+    const topHCrossV = new Int32Array(h * (w - 1)).fill(-1);
+    const botHCrossV = new Int32Array(h * (w - 1)).fill(-1);
+    const topVCrossV = new Int32Array((h - 1) * w).fill(-1);
+    const botVCrossV = new Int32Array((h - 1) * w).fill(-1);
     const positions = [];
     const indices = [];
 
-    function getTopV(r, c, z) {
-      const p = r * paddedW + c;
-      if (topV[p] === -1) {
-        topV[p] = positions.length / 3;
-        positions.push(c * scale - cx, (paddedH - r) * scale - cy, z);
+    function getTopGrid(x, y, z) {
+      const idx = y * w + x;
+      if (topGridV[idx] === -1) {
+        topGridV[idx] = positions.length / 3;
+        positions.push(x * scale - cx, (h - 1 - y) * scale - cy, z);
       }
-      return topV[p];
+      return topGridV[idx];
     }
 
-    function getBotV(r, c, z) {
-      const p = r * paddedW + c;
-      if (Math.abs(z) < 1e-4 && topV[p] !== -1) {
-        return topV[p];
+    function getBotGrid(x, y, z) {
+      const idx = y * w + x;
+      if (botGridV[idx] === -1) {
+        botGridV[idx] = positions.length / 3;
+        positions.push(x * scale - cx, (h - 1 - y) * scale - cy, isDoubleSided ? -z : 0.0);
       }
-      if (botV[p] === -1) {
-        botV[p] = positions.length / 3;
-        positions.push(c * scale - cx, (paddedH - r) * scale - cy, -z);
-      }
-      return botV[p];
+      return botGridV[idx];
     }
 
-    for (let r = 0; r < paddedH - 1; r++) {
-      for (let c = 0; c < paddedW - 1; c++) {
-        const p00 = r * paddedW + c;
-        const p10 = r * paddedW + (c + 1);
-        const p01 = (r + 1) * paddedW + c;
-        const p11 = (r + 1) * paddedW + (c + 1);
+    function getTopHCross(x, y) {
+      const idx = y * (w - 1) + x;
+      if (topHCrossV[idx] === -1) {
+        topHCrossV[idx] = positions.length / 3;
+        positions.push(hCross[idx] * scale - cx, (h - 1 - y) * scale - cy, 0.0);
+      }
+      return topHCrossV[idx];
+    }
 
-        const z00 = Z[p00], z10 = Z[p10];
-        const z01 = Z[p01], z11 = Z[p11];
+    function getBotHCross(x, y) {
+      const idx = y * (w - 1) + x;
+      if (botHCrossV[idx] === -1) {
+        botHCrossV[idx] = positions.length / 3;
+        positions.push(hCross[idx] * scale - cx, (h - 1 - y) * scale - cy, 0.0);
+      }
+      return botHCrossV[idx];
+    }
 
-        // If all 4 corners are 0, skip
-        if (z00 === 0 && z10 === 0 && z01 === 0 && z11 === 0) continue;
+    function getTopVCross(x, y) {
+      const idx = y * w + x;
+      if (topVCrossV[idx] === -1) {
+        topVCrossV[idx] = positions.length / 3;
+        positions.push(x * scale - cx, (h - 1 - vCross[idx]) * scale - cy, 0.0);
+      }
+      return topVCrossV[idx];
+    }
 
-        const r0 = r, r1 = r + 1, c0 = c, c1 = c + 1;
+    function getBotVCross(x, y) {
+      const idx = y * w + x;
+      if (botVCrossV[idx] === -1) {
+        botVCrossV[idx] = positions.length / 3;
+        positions.push(x * scale - cx, (h - 1 - vCross[idx]) * scale - cy, 0.0);
+      }
+      return botVCrossV[idx];
+    }
 
-        if (isDoubleSided) {
-          // Adaptive diagonal split to avoid diagonal saddle line through zero
-          if ((z01 === 0 && z10 === 0 && (z00 > 0 || z11 > 0)) || Math.abs(z00 - z11) < Math.abs(z01 - z10)) {
-            // Tri 1: (00, 01, 11)
-            if (!(z00 === 0 && z01 === 0 && z11 === 0)) {
-              indices.push(getTopV(r0, c0, z00), getTopV(r1, c0, z01), getTopV(r1, c1, z11));
-              indices.push(getBotV(r0, c0, z00), getBotV(r1, c1, z11), getBotV(r1, c0, z01));
-            }
-            // Tri 2: (00, 11, 10)
-            if (!(z00 === 0 && z11 === 0 && z10 === 0)) {
-              indices.push(getTopV(r0, c0, z00), getTopV(r1, c1, z11), getTopV(r0, c1, z10));
-              indices.push(getBotV(r0, c0, z00), getBotV(r0, c1, z10), getBotV(r1, c1, z11));
-            }
-          } else {
-            // Tri 1: (00, 01, 10)
-            if (!(z00 === 0 && z01 === 0 && z10 === 0)) {
-              indices.push(getTopV(r0, c0, z00), getTopV(r1, c0, z01), getTopV(r0, c1, z10));
-              indices.push(getBotV(r0, c0, z00), getBotV(r0, c1, z10), getBotV(r1, c0, z01));
-            }
-            // Tri 2: (10, 01, 11)
-            if (!(z10 === 0 && z01 === 0 && z11 === 0)) {
-              indices.push(getTopV(r0, c1, z10), getTopV(r1, c0, z01), getTopV(r1, c1, z11));
-              indices.push(getBotV(r0, c1, z10), getBotV(r1, c1, z11), getBotV(r1, c0, z01));
-            }
-          }
-        } else {
-          // Single-sided mode
-          const v00 = getTopV(r0, c0, z00);
-          const v10 = getTopV(r0, c1, z10);
-          const v01 = getTopV(r1, c0, z01);
-          const v11 = getTopV(r1, c1, z11);
-          indices.push(v00, v01, v10);
-          indices.push(v10, v01, v11);
+    function addTri(t0, t1, t2, b0, b1, b2) {
+      indices.push(t0, t1, t2);
+      indices.push(b0, b2, b1);
+    }
 
-          const b00 = getBotV(r0, c0, 0);
-          const b10 = getBotV(r0, c1, 0);
-          const b01 = getBotV(r1, c0, 0);
-          const b11 = getBotV(r1, c1, 0);
-          indices.push(b00, b10, b01);
-          indices.push(b10, b11, b01);
+    function addPoly(topPts, botPts) {
+      for (let i = 1; i < topPts.length - 1; i++) {
+        addTri(topPts[0], topPts[i], topPts[i + 1], botPts[0], botPts[i], botPts[i + 1]);
+      }
+    }
 
-          if (r === 0 || !mask[(r - 1) * paddedW + c]) {
-            indices.push(b00, v00, v10); indices.push(b00, v10, b10);
-          }
-          if (r === paddedH - 2 || !mask[(r + 1) * paddedW + c]) {
-            indices.push(b01, v11, v01); indices.push(b01, b11, v11);
-          }
-          if (c === 0 || !mask[r * paddedW + (c - 1)]) {
-            indices.push(b00, v01, v00); indices.push(b00, b01, v01);
-          }
-          if (c === paddedW - 2 || !mask[r * paddedW + (c + 1)]) {
-            indices.push(b10, v10, v11); indices.push(b10, v11, b11);
-          }
+    for (let y = 0; y < h - 1; y++) {
+      const r0 = y, r1 = y + 1;
+      const row0 = r0 * w, row1 = r1 * w;
+      for (let x = 0; x < w - 1; x++) {
+        const c0 = x, c1 = x + 1;
+        const b0 = rawMask[row0 + c0];
+        const b1 = rawMask[row0 + c1];
+        const b2 = rawMask[row1 + c1];
+        const b3 = rawMask[row1 + c0];
+        const code = b0 | (b1 << 1) | (b2 << 2) | (b3 << 3);
+        if (code === 0) continue;
+
+        const zTL = Z[row0 + c0], zTR = Z[row0 + c1], zBR = Z[row1 + c1], zBL = Z[row1 + c0];
+        const TL_t = getTopGrid(c0, r0, zTL), TL_b = getBotGrid(c0, r0, zTL);
+        const TR_t = getTopGrid(c1, r0, zTR), TR_b = getBotGrid(c1, r0, zTR);
+        const BR_t = getTopGrid(c1, r1, zBR), BR_b = getBotGrid(c1, r1, zBR);
+        const BL_t = getTopGrid(c0, r1, zBL), BL_b = getBotGrid(c0, r1, zBL);
+
+        if (code === 15) {
+          addTri(BL_t, BR_t, TR_t, BL_b, BR_b, TR_b);
+          addTri(BL_t, TR_t, TL_t, BL_b, TR_b, TL_b);
+          continue;
         }
+
+        const Et_t = ((code & 3) === 1 || (code & 3) === 2) ? getTopHCross(c0, r0) : -1;
+        const Et_b = ((code & 3) === 1 || (code & 3) === 2) ? getBotHCross(c0, r0) : -1;
+        const Er_t = ((code & 6) === 2 || (code & 6) === 4) ? getTopVCross(c1, r0) : -1;
+        const Er_b = ((code & 6) === 2 || (code & 6) === 4) ? getBotVCross(c1, r0) : -1;
+        const Eb_t = ((code & 12) === 4 || (code & 12) === 8) ? getTopHCross(c0, r1) : -1;
+        const Eb_b = ((code & 12) === 4 || (code & 12) === 8) ? getBotHCross(c0, r1) : -1;
+        const El_t = ((code & 9) === 1 || (code & 9) === 8) ? getTopVCross(c0, r0) : -1;
+        const El_b = ((code & 9) === 1 || (code & 9) === 8) ? getBotVCross(c0, r0) : -1;
+
+        let pTop = null, pBot = null;
+        if (code === 1) { pTop = [TL_t, El_t, Et_t]; pBot = [TL_b, El_b, Et_b]; }
+        else if (code === 2) { pTop = [TR_t, Et_t, Er_t]; pBot = [TR_b, Et_b, Er_b]; }
+        else if (code === 4) { pTop = [BR_t, Er_t, Eb_t]; pBot = [BR_b, Er_b, Eb_b]; }
+        else if (code === 8) { pTop = [BL_t, Eb_t, El_t]; pBot = [BL_b, Eb_b, El_b]; }
+        else if (code === 3) { pTop = [TL_t, El_t, Er_t, TR_t]; pBot = [TL_b, El_b, Er_b, TR_b]; }
+        else if (code === 6) { pTop = [TR_t, Et_t, Eb_t, BR_t]; pBot = [TR_b, Et_b, Eb_b, BR_b]; }
+        else if (code === 12) { pTop = [BR_t, Er_t, El_t, BL_t]; pBot = [BR_b, Er_b, El_b, BL_b]; }
+        else if (code === 9) { pTop = [BL_t, Eb_t, Et_t, TL_t]; pBot = [BL_b, Eb_b, Et_b, TL_b]; }
+        else if (code === 14) { pTop = [BL_t, BR_t, TR_t, Et_t, El_t]; pBot = [BL_b, BR_b, TR_b, Et_b, El_b]; }
+        else if (code === 13) { pTop = [BL_t, BR_t, Er_t, Et_t, TL_t]; pBot = [BL_b, BR_b, Er_b, Et_b, TL_b]; }
+        else if (code === 11) { pTop = [BL_t, Eb_t, Er_t, TR_t, TL_t]; pBot = [BL_b, Eb_b, Er_b, TR_b, TL_b]; }
+        else if (code === 7) { pTop = [El_t, Eb_t, BR_t, TR_t, TL_t]; pBot = [El_b, Eb_b, BR_b, TR_b, TL_b]; }
+        else if (code === 5) {
+          addTri(TL_t, El_t, Et_t, TL_b, El_b, Et_b);
+          addTri(BR_t, Er_t, Eb_t, BR_b, Er_b, Eb_b);
+          continue;
+        } else if (code === 10) {
+          addTri(TR_t, Et_t, Er_t, TR_b, Et_b, Er_b);
+          addTri(BL_t, Eb_t, El_t, BL_b, Eb_b, El_b);
+          continue;
+        }
+
+        if (pTop) addPoly(pTop, pBot);
       }
     }
 
@@ -694,7 +720,7 @@ function build3DModel() {
     mesh.receiveShadow = true;
     meshGroup.add(mesh);
 
-    const lengthY = (paddedH * scale).toFixed(1);
+    const lengthY = (h * scale).toFixed(1);
     const heightZ = (baseThickness + bevelHeight).toFixed(1);
 
     state.stlBlob = createBinarySTL(positionFloatArray, indexUintArray);

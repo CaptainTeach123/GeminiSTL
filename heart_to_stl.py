@@ -70,106 +70,119 @@ def create_heart_stl(
             
     # 4. Continuous Level-Set contour field
     smooth_float = gaussian_filter(filled_mask.astype(np.float32), sigma=2.0)
-    mask_grid = (smooth_float >= 0.5)
+    T = 0.5
+    mask_grid = (smooth_float >= T)
     
-    print(f"Generating {'double-sided' if double_sided else 'single-sided'} pure CAD geometry on {target_w}x{target_h} grid...")
+    print(f"Generating {'double-sided' if double_sided else 'single-sided'} Marching Squares CAD geometry on {target_w}x{target_h} grid...")
     
     # 5. Continuous distance transform (sigma=1.5 removes Voronoi grid discretization)
     raw_dist = distance_transform_edt(mask_grid)
     dist = gaussian_filter(raw_dist, sigma=1.5)
-    d_max = dist.max() + 1e-5
     
-    # 6. Pure Geometric CAD Blade Sculpting (ZERO photographic glare distortion):
-    # Smooth 45-degree chamfer bevel rising over 14 pixels with C1 smoothstep continuity
-    t_chamfer = np.clip(dist / 14.0, 0.0, 1.0)
-    chamfer_bevel = t_chamfer * t_chamfer * (3.0 - 2.0 * t_chamfer)
-    
-    # Aerodynamic continuous blade roof (ensures narrow spikes reach proud height)
+    # 6. Pure Geometric CAD Blade Sculpting:
+    # Direct sinusoidal chamfer bevel rising continuously from perimeter edge (d=0, Z=0)
+    # Zero flat brim/shelf, zero artificial feathering
+    t_bevel = np.clip(dist / 14.0, 0.0, 1.0)
+    bevel_profile = np.sin(t_bevel * (np.pi / 2.0))
     blade_roof = 1.0 - np.exp(-dist / 8.0)
-    
-    # Composite: 60% chamfer bevel + 40% blade roof
-    sculpted = (chamfer_bevel * 0.60) + (blade_roof * 0.40)
-    
-    # Smooth level-set alpha feathering at perimeter knife-edge:
-    # Eliminates vertical edge cliffs and serrated teeth
-    alpha = np.clip(smooth_float * 2.0 - 1.0, 0.0, 1.0)
-    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+    sculpted = (bevel_profile * 0.70) + (blade_roof * 0.30)
     
     half_h = (base_thickness + bevel_height) / 2.0 if double_sided else bevel_height
     
     if double_sided:
-        Z = np.where(mask_grid, sculpted * half_h * alpha, 0.0)
+        Z = np.where(mask_grid, sculpted * half_h, 0.0)
     else:
         base_taper = np.clip(dist / 4.0, 0.0, 1.0)
-        Z = np.where(mask_grid, (base_taper * base_thickness) + (sculpted * bevel_height * alpha), 0.0)
+        Z = np.where(mask_grid, (base_taper * base_thickness) + (sculpted * bevel_height), 0.0)
         
-    # Global surface relaxation filter: guarantees glass-smooth C2 continuity across entire mesh
-    Z = gaussian_filter(Z, sigma=1.0) * mask_grid
-    
-    # Pad edges with zeros so geometry closes cleanly
-    Z = np.pad(Z, pad_width=1, mode="constant", constant_values=0.0)
-    mask_grid = Z > 0
-    
-    H, W = Z.shape
+    H, W = smooth_float.shape
     scale = width_mm / W
     
+    # 7. Sub-pixel Marching Squares edge crossings
+    h_cross = (smooth_float[:, :-1] >= T) != (smooth_float[:, 1:] >= T)
+    h_x = np.zeros((H, W - 1), dtype=np.float32)
+    r_idx, c_idx = np.where(h_cross)
+    v0 = smooth_float[r_idx, c_idx]
+    v1 = smooth_float[r_idx, c_idx + 1]
+    t = np.clip((T - v0) / (v1 - v0 + 1e-12), 0.0001, 0.9999)
+    h_x[r_idx, c_idx] = (c_idx + t) * scale
+
+    v_cross = (smooth_float[:-1, :] >= T) != (smooth_float[1:, :] >= T)
+    v_y = np.zeros((H - 1, W), dtype=np.float32)
+    r_idx, c_idx = np.where(v_cross)
+    v0 = smooth_float[r_idx, c_idx]
+    v1 = smooth_float[r_idx + 1, c_idx]
+    t = np.clip((T - v0) / (v1 - v0 + 1e-12), 0.0001, 0.9999)
+    v_y[r_idx, c_idx] = (H - 1 - (r_idx + t)) * scale
+
+    b0 = mask_grid[:-1, :-1].astype(np.uint8)
+    b1 = mask_grid[:-1, 1:].astype(np.uint8)
+    b2 = mask_grid[1:, 1:].astype(np.uint8)
+    b3 = mask_grid[1:, :-1].astype(np.uint8)
+    case_grid = b0 | (b1 << 1) | (b2 << 2) | (b3 << 3)
+
+    top_triangles = []
+    nz_r, nz_c = np.where(case_grid > 0)
+    print(f"Triangulating {len(nz_r):,} active cells with sub-pixel level-set contours...")
+
+    for r, c in zip(nz_r, nz_c):
+        code = case_grid[r, c]
+        x0 = c * scale
+        x1 = (c + 1) * scale
+        y_bot = (H - 1 - (r + 1)) * scale
+        y_top = (H - 1 - r) * scale
+        
+        TL = (x0, y_top, Z[r, c])
+        TR = (x1, y_top, Z[r, c + 1])
+        BR = (x1, y_bot, Z[r + 1, c + 1])
+        BL = (x0, y_bot, Z[r + 1, c])
+        
+        if code == 15:
+            top_triangles.append((BL, BR, TR))
+            top_triangles.append((BL, TR, TL))
+            continue
+            
+        Et = (h_x[r, c], y_top, 0.0) if (code & 3) in (1, 2) else None
+        Er = (x1, v_y[r, c + 1], 0.0) if (code & 6) in (2, 4) else None
+        Eb = (h_x[r + 1, c], y_bot, 0.0) if (code & 12) in (4, 8) else None
+        El = (x0, v_y[r, c], 0.0) if (code & 9) in (1, 8) else None
+        
+        poly = None
+        if code == 1: poly = [TL, El, Et]
+        elif code == 2: poly = [TR, Et, Er]
+        elif code == 4: poly = [BR, Er, Eb]
+        elif code == 8: poly = [BL, Eb, El]
+        elif code == 3: poly = [TL, El, Er, TR]
+        elif code == 6: poly = [TR, Et, Eb, BR]
+        elif code == 12: poly = [BR, Er, El, BL]
+        elif code == 9: poly = [BL, Eb, Et, TL]
+        elif code == 14: poly = [BL, BR, TR, Et, El]
+        elif code == 13: poly = [BL, BR, Er, Et, TL]
+        elif code == 11: poly = [BL, Eb, Er, TR, TL]
+        elif code == 7: poly = [El, Eb, BR, TR, TL]
+        elif code == 5:
+            top_triangles.append((TL, El, Et))
+            top_triangles.append((BR, Er, Eb))
+            continue
+        elif code == 10:
+            top_triangles.append((TR, Et, Er))
+            top_triangles.append((BL, Eb, El))
+            continue
+
+        if poly is not None:
+            for i in range(1, len(poly) - 1):
+                top_triangles.append((poly[0], poly[i], poly[i + 1]))
+
+    # 8. Symmetrical double-sided solid closure (0 open boundary edges)
     faces = []
-    print("Building watertight 3D solid mesh with seamless CAD surfaces...")
-    
-    for r in range(H - 1):
-        for c in range(W - 1):
-            z00, z10 = Z[r, c], Z[r, c+1]
-            z01, z11 = Z[r+1, c], Z[r+1, c+1]
-            
-            # If all 4 corners are 0, skip
-            if z00 == 0 and z10 == 0 and z01 == 0 and z11 == 0:
-                continue
-                
-            x0, x1 = c * scale, (c + 1) * scale
-            y0, y1 = (H - r) * scale, (H - (r + 1)) * scale
-            
-            if double_sided:
-                # Adaptive diagonal split to avoid diagonal saddle line through zero
-                if (z01 == 0 and z10 == 0 and (z00 > 0 or z11 > 0)) or abs(z00 - z11) < abs(z01 - z10):
-                    # Tri 1: (00, 01, 11)
-                    if not (z00 == 0 and z01 == 0 and z11 == 0):
-                        faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y1, z11]])
-                        faces.append([[x0, y0, -z00], [x1, y1, -z11], [x0, y1, -z01]])
-                    # Tri 2: (00, 11, 10)
-                    if not (z00 == 0 and z11 == 0 and z10 == 0):
-                        faces.append([[x0, y0, z00], [x1, y1, z11], [x1, y0, z10]])
-                        faces.append([[x0, y0, -z00], [x1, y0, -z10], [x1, y1, -z11]])
-                else:
-                    # Tri 1: (00, 01, 10)
-                    if not (z00 == 0 and z01 == 0 and z10 == 0):
-                        faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y0, z10]])
-                        faces.append([[x0, y0, -z00], [x1, y0, -z10], [x0, y1, -z01]])
-                    # Tri 2: (10, 01, 11)
-                    if not (z10 == 0 and z01 == 0 and z11 == 0):
-                        faces.append([[x1, y0, z10], [x0, y1, z01], [x1, y1, z11]])
-                        faces.append([[x1, y0, -z10], [x1, y1, -z11], [x0, y1, -z01]])
-            else:
-                # Top sculpted surface (+Z)
-                faces.append([[x0, y0, z00], [x0, y1, z01], [x1, y0, z10]])
-                faces.append([[x1, y0, z10], [x0, y1, z01], [x1, y1, z11]])
-                
-                # Flat bottom surface (Z=0)
-                faces.append([[x0, y0, 0], [x1, y0, 0], [x0, y1, 0]])
-                faces.append([[x1, y0, 0], [x1, y1, 0], [x0, y1, 0]])
-                
-                # Side walls (single-sided mode)
-                if r == 0 or not mask_grid[r-1, c]:
-                    faces.append([[x0, y0, 0], [x0, y0, z00], [x1, y0, z10]])
-                    faces.append([[x0, y0, 0], [x1, y0, z10], [x1, y0, 0]])
-                if r == H - 2 or not mask_grid[r+1, c]:
-                    faces.append([[x0, y1, 0], [x1, y1, z11], [x0, y1, z01]])
-                    faces.append([[x0, y1, 0], [x1, y1, 0], [x1, y1, z11]])
-                if c == 0 or not mask_grid[r, c-1]:
-                    faces.append([[x0, y0, 0], [x0, y1, z01], [x0, y0, z00]])
-                    faces.append([[x0, y0, 0], [x0, y1, 0], [x0, y1, z01]])
-                if c == W - 2 or not mask_grid[r, c+1]:
-                    faces.append([[x1, y0, 0], [x1, y0, z10], [x1, y1, z11]])
-                    faces.append([[x1, y0, 0], [x1, y1, z11], [x1, y1, 0]])
+    if double_sided:
+        for p0, p1, p2 in top_triangles:
+            faces.append([p0, p1, p2])
+            faces.append([[p0[0], p0[1], -p0[2]], [p2[0], p2[1], -p2[2]], [p1[0], p1[1], -p1[2]]])
+    else:
+        for p0, p1, p2 in top_triangles:
+            faces.append([p0, p1, p2])
+            faces.append([[p0[0], p0[1], 0.0], [p2[0], p2[1], 0.0], [p1[0], p1[1], 0.0]])
 
     faces_arr = np.array(faces, dtype=np.float32)
     heart_mesh = mesh.Mesh(np.zeros(faces_arr.shape[0], dtype=mesh.Mesh.dtype))
