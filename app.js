@@ -155,7 +155,7 @@ function filterConnectedComponents(mask, w, h, data) {
       queue[tail++] = startIdx;
       visited[startIdx] = 1;
 
-      let sumG = 0, sumLum = 0;
+      let sumG = 0, sumB = 0, sumLum = 0;
 
       while (head < tail) {
         const cur = queue[head++];
@@ -165,6 +165,7 @@ function filterConnectedComponents(mask, w, h, data) {
         const p = cur * 4;
         const r = data[p], g = data[p + 1], b = data[p + 2];
         sumG += g;
+        sumB += b;
         sumLum += (0.299 * r + 0.587 * g + 0.114 * b);
 
         if (cx > 0) { const n = cur - 1; if (mask[n] && !visited[n]) { visited[n] = 1; queue[tail++] = n; } }
@@ -175,9 +176,12 @@ function filterConnectedComponents(mask, w, h, data) {
 
       const compSize = tail;
       const meanG = sumG / compSize;
+      const meanB = sumB / compSize;
       const meanLum = sumLum / compSize;
 
-      if (compSize >= minSize && meanLum > 35 && (meanG > 15 || compSize > 5000)) {
+      // Retain all genuine heart features (including delicate tribal hooks, spurs, and barbs)
+      // Discards only dark background vignette (near black, lum < 30)
+      if (meanLum > 30 && (meanG > 15 || meanB > 25 || compSize > 1000)) {
         for (let i = 0; i < tail; i++) {
           cleanMask[queue[i]] = 1;
         }
@@ -429,6 +433,7 @@ function getMaskFromImage(img, maxSize) {
   }
 
   let finalMask = rawMask;
+  let smoothFloat = null;
   if (mode === "tribal") {
     // 1. Filter out corner vignette & isolated debris on raw mask
     const filtered = filterConnectedComponents(rawMask, w, h, data);
@@ -450,14 +455,16 @@ function getMaskFromImage(img, maxSize) {
     const filled = fillSmallHoles(filtered, w, h, maxNoiseHole);
 
     // 3. Level-set contour smoothing: turns jagged 1-2px raster staircases into silky smooth curves
-    const smoothFloat = gaussianFilter(filled, w, h, 1.8);
+    smoothFloat = gaussianFilter(filled, w, h, 1.8);
     finalMask = new Uint8Array(w * h);
     for (let i = 0; i < w * h; i++) {
       finalMask[i] = smoothFloat[i] >= 0.5 ? 1 : 0;
     }
+  } else {
+    smoothFloat = gaussianFilter(finalMask, w, h, 1.2);
   }
 
-  return { w, h, mask: finalMask, canvas };
+  return { w, h, mask: finalMask, smoothFloat, canvas };
 }
 
 function updateMaskPreview() {
@@ -499,33 +506,59 @@ function build3DModel() {
     const bevelHeight = parseFloat(dom.bevelHeight.value);
     const sigma = parseFloat(dom.smoothingSigma.value);
 
-    const { w, h, mask: rawMask, canvas } = getMaskFromImage(state.image, maxSize);
+    const { w, h, mask: rawMask, smoothFloat, canvas } = getMaskFromImage(state.image, maxSize);
     const ctx = canvas.getContext("2d");
     const imgData = ctx.getImageData(0, 0, w, h).data;
+
+    // Sub-pixel Level-Set gradient projection: eliminates the 90-degree integer raster staircasing
+    const shiftX = new Float32Array(w * h);
+    const shiftY = new Float32Array(w * h);
+    if (smoothFloat) {
+      for (let r = 0; r < h; r++) {
+        for (let c = 0; c < w; c++) {
+          const idx = r * w + c;
+          const val = smoothFloat[idx];
+          if (val >= 0.08 && val <= 0.92) {
+            const cL = c > 0 ? c - 1 : c;
+            const cR = c < w - 1 ? c + 1 : c;
+            const rU = r > 0 ? r - 1 : r;
+            const rD = r < h - 1 ? r + 1 : r;
+            const gx = (smoothFloat[r * w + cR] - smoothFloat[r * w + cL]) * 0.5;
+            const gy = (smoothFloat[rD * w + c] - smoothFloat[rU * w + c]) * 0.5;
+            const g2 = gx * gx + gy * gy + 1e-6;
+            const factor = (0.5 - val) / g2;
+            shiftX[idx] = Math.max(-0.85, Math.min(0.85, factor * gx));
+            shiftY[idx] = Math.max(-0.85, Math.min(0.85, factor * gy));
+          }
+        }
+      }
+    }
 
     // Compute exact Euclidean Distance Transform
     const dist = distanceTransform(rawMask, w, h);
 
-    let maxDist = 0;
+    // Multi-scale Chiseled Blade Sculpting:
+    // Local 45-degree chamfer (8px) + aerodynamic blade roof + unsharp-masked metallic chrome relief
+    const lumArray = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
-      if (dist[i] > maxDist) maxDist = dist[i];
+      const p = i * 4;
+      lumArray[i] = (0.299 * imgData[p] + 0.587 * imgData[p + 1] + 0.114 * imgData[p + 2]) / 255.0;
     }
-    maxDist += 1e-5;
+    const lumBase = gaussianFilter(lumArray, w, h, 0.8);
+    const lumCoarse = gaussianFilter(lumArray, w, h, 3.5);
 
-    // Precision Sculpted Blade Profile:
-    // 45-degree chamfer bevel (12px) + aerodynamic blade spine + rich metallic chrome relief
     const rawProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       if (!rawMask[i]) continue;
-      const chamfer = Math.min(dist[i] / 12.0, 1.0);
-      const spine = Math.pow(dist[i] / maxDist, 0.6);
+      const d = dist[i];
+      const chamfer = Math.min(d / 8.0, 1.0);
+      const bladeRoof = 1.0 - Math.exp(-d / 8.0);
 
-      const p = i * 4;
-      const r = imgData[p], g = imgData[p + 1], b = imgData[p + 2];
-      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
-      const lumRelief = Math.max(0, Math.min(1.0, (lum - 0.15) / 0.85));
+      const lumDetail = lumArray[i] - lumCoarse[i];
+      const chiseledLum = Math.max(0, Math.min(1.0, lumBase[i] + 1.2 * lumDetail));
+      const lumRelief = Math.max(0, Math.min(1.0, (chiseledLum - 0.12) / 0.88));
 
-      rawProfile[i] = (chamfer * 0.35) + (spine * 0.25) + (lumRelief * 0.40);
+      rawProfile[i] = (chamfer * 0.30) + (bladeRoof * 0.30) + (lumRelief * 0.40);
     }
 
     const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma) : rawProfile;
@@ -534,6 +567,8 @@ function build3DModel() {
     const paddedW = w + 2;
     const paddedH = h + 2;
     const Z = new Float32Array(paddedW * paddedH);
+    const padShiftX = new Float32Array(paddedW * paddedH);
+    const padShiftY = new Float32Array(paddedW * paddedH);
     const mask = new Uint8Array(paddedW * paddedH);
 
     const halfH = isDoubleSided ? ((baseThickness + bevelHeight) / 2.0) : bevelHeight;
@@ -542,16 +577,18 @@ function build3DModel() {
       for (let c = 0; c < w; c++) {
         const rawIdx = r * w + c;
         const padIdx = (r + 1) * paddedW + (c + 1);
+        padShiftX[padIdx] = shiftX[rawIdx];
+        padShiftY[padIdx] = shiftY[rawIdx];
         if (rawMask[rawIdx]) {
           mask[padIdx] = 1;
           const d = dist[rawIdx];
-          // Smooth continuous feathering over 4 pixels down to 0 at the knife edge
-          const edgeFeather = Math.pow(Math.min(d / 4.0, 1.0), 1.2);
+          const edgeFeather = Math.pow(Math.min(d / 3.0, 1.0), 1.1);
+          const alpha = smoothFloat ? Math.max(0, Math.min(1.0, smoothFloat[rawIdx] * 2.0 - 0.5)) : 1.0;
           if (isDoubleSided) {
-            Z[padIdx] = edgeFeather * smoothProfile[rawIdx] * halfH;
+            Z[padIdx] = edgeFeather * smoothProfile[rawIdx] * halfH * alpha;
           } else {
             const baseTaper = Math.min(d / 4.0, 1.0);
-            Z[padIdx] = (baseTaper * baseThickness) + (smoothProfile[rawIdx] * bevelHeight);
+            Z[padIdx] = (baseTaper * baseThickness) + (smoothProfile[rawIdx] * bevelHeight * alpha);
           }
         }
       }
@@ -567,22 +604,26 @@ function build3DModel() {
     const positions = [];
     const indices = [];
 
-    function getTopV(r, c, x, y, z) {
+    function getTopV(r, c, z) {
       const p = r * paddedW + c;
       if (topV[p] === -1) {
         topV[p] = positions.length / 3;
+        const x = (c + padShiftX[p]) * scale;
+        const y = (paddedH - (r + padShiftY[p])) * scale;
         positions.push(x - cx, y - cy, z);
       }
       return topV[p];
     }
 
-    function getBotV(r, c, x, y, z) {
+    function getBotV(r, c, z) {
       const p = r * paddedW + c;
       if (Math.abs(z) < 1e-4 && topV[p] !== -1) {
         return topV[p];
       }
       if (botV[p] === -1) {
         botV[p] = positions.length / 3;
+        const x = (c + padShiftX[p]) * scale;
+        const y = (paddedH - (r + padShiftY[p])) * scale;
         positions.push(x - cx, y - cy, -z);
       }
       return botV[p];
@@ -601,11 +642,6 @@ function build3DModel() {
         // If all 4 corners are 0, skip
         if (z00 === 0 && z10 === 0 && z01 === 0 && z11 === 0) continue;
 
-        const x0 = c * scale;
-        const x1 = (c + 1) * scale;
-        const y0 = (paddedH - r) * scale;
-        const y1 = (paddedH - (r + 1)) * scale;
-
         const r0 = r, r1 = r + 1, c0 = c, c1 = c + 1;
 
         if (isDoubleSided) {
@@ -613,39 +649,39 @@ function build3DModel() {
           if ((z01 === 0 && z10 === 0 && (z00 > 0 || z11 > 0)) || Math.abs(z00 - z11) < Math.abs(z01 - z10)) {
             // Tri 1: (00, 01, 11)
             if (!(z00 === 0 && z01 === 0 && z11 === 0)) {
-              indices.push(getTopV(r0, c0, x0, y0, z00), getTopV(r1, c0, x0, y1, z01), getTopV(r1, c1, x1, y1, z11));
-              indices.push(getBotV(r0, c0, x0, y0, z00), getBotV(r1, c1, x1, y1, z11), getBotV(r1, c0, x0, y1, z01));
+              indices.push(getTopV(r0, c0, z00), getTopV(r1, c0, z01), getTopV(r1, c1, z11));
+              indices.push(getBotV(r0, c0, z00), getBotV(r1, c1, z11), getBotV(r1, c0, z01));
             }
             // Tri 2: (00, 11, 10)
             if (!(z00 === 0 && z11 === 0 && z10 === 0)) {
-              indices.push(getTopV(r0, c0, x0, y0, z00), getTopV(r1, c1, x1, y1, z11), getTopV(r0, c1, x1, y0, z10));
-              indices.push(getBotV(r0, c0, x0, y0, z00), getBotV(r0, c1, x1, y0, z10), getBotV(r1, c1, x1, y1, z11));
+              indices.push(getTopV(r0, c0, z00), getTopV(r1, c1, z11), getTopV(r0, c1, z10));
+              indices.push(getBotV(r0, c0, z00), getBotV(r0, c1, z10), getBotV(r1, c1, z11));
             }
           } else {
             // Tri 1: (00, 01, 10)
             if (!(z00 === 0 && z01 === 0 && z10 === 0)) {
-              indices.push(getTopV(r0, c0, x0, y0, z00), getTopV(r1, c0, x0, y1, z01), getTopV(r0, c1, x1, y0, z10));
-              indices.push(getBotV(r0, c0, x0, y0, z00), getBotV(r0, c1, x1, y0, z10), getBotV(r1, c0, x0, y1, z01));
+              indices.push(getTopV(r0, c0, z00), getTopV(r1, c0, z01), getTopV(r0, c1, z10));
+              indices.push(getBotV(r0, c0, z00), getBotV(r0, c1, z10), getBotV(r1, c0, z01));
             }
             // Tri 2: (10, 01, 11)
             if (!(z10 === 0 && z01 === 0 && z11 === 0)) {
-              indices.push(getTopV(r0, c1, x1, y0, z10), getTopV(r1, c0, x0, y1, z01), getTopV(r1, c1, x1, y1, z11));
-              indices.push(getBotV(r0, c1, x1, y0, z10), getBotV(r1, c1, x1, y1, z11), getBotV(r1, c0, x0, y1, z01));
+              indices.push(getTopV(r0, c1, z10), getTopV(r1, c0, z01), getTopV(r1, c1, z11));
+              indices.push(getBotV(r0, c1, z10), getBotV(r1, c1, z11), getBotV(r1, c0, z01));
             }
           }
         } else {
           // Single-sided mode
-          const v00 = getTopV(r0, c0, x0, y0, z00);
-          const v10 = getTopV(r0, c1, x1, y0, z10);
-          const v01 = getTopV(r1, c0, x0, y1, z01);
-          const v11 = getTopV(r1, c1, x1, y1, z11);
+          const v00 = getTopV(r0, c0, z00);
+          const v10 = getTopV(r0, c1, z10);
+          const v01 = getTopV(r1, c0, z01);
+          const v11 = getTopV(r1, c1, z11);
           indices.push(v00, v01, v10);
           indices.push(v10, v01, v11);
 
-          const b00 = getBotV(r0, c0, x0, y0, 0);
-          const b10 = getBotV(r0, c1, x1, y0, 0);
-          const b01 = getBotV(r1, c0, x0, y1, 0);
-          const b11 = getBotV(r1, c1, x1, y1, 0);
+          const b00 = getBotV(r0, c0, 0);
+          const b10 = getBotV(r0, c1, 0);
+          const b01 = getBotV(r1, c0, 0);
+          const b11 = getBotV(r1, c1, 0);
           indices.push(b00, b10, b01);
           indices.push(b10, b11, b01);
 
