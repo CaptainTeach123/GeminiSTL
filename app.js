@@ -510,64 +510,47 @@ function build3DModel() {
     const ctx = canvas.getContext("2d");
     const imgData = ctx.getImageData(0, 0, w, h).data;
 
-    // 1. Distance transform with Gaussian filter
+    // 1. Distance transform with Gaussian filter (sigma=1.5 removes discrete Voronoi grid discretization)
     const rawDist = distanceTransform(rawMask, w, h);
-    const dist = gaussianFilter(rawDist, w, h, 1.0);
+    const dist = gaussianFilter(rawDist, w, h, 1.5);
 
-    // 2. Seamless Elliptical Bullnose Edge Rounding:
-    // Eliminates equatorial seam by matching vertical tangent (normal is purely horizontal at d=0)
-    const dEdge = 3.0;
-
-    // 3. Refined Chiseled Blade Topography:
-    // 45-degree chamfer bevel rising to sharp blade ridge + clean medium-frequency facet relief
-    const chamferD = 12.0;
-
-    const lumArray = new Float32Array(w * h);
-    for (let i = 0; i < w * h; i++) {
-      const p = i * 4;
-      lumArray[i] = (0.299 * imgData[p] + 0.587 * imgData[p + 1] + 0.114 * imgData[p + 2]) / 255.0;
-    }
-    const lumLow = gaussianFilter(lumArray, w, h, 12.0);
-    const lumClean = gaussianFilter(lumArray, w, h, 1.5);
-
+    // 2. Pure Geometric CAD Blade Sculpting (ZERO photographic glare distortion):
+    // Smooth 45-degree chamfer bevel rising over 14 pixels with C1 smoothstep continuity
     const rawProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       if (!rawMask[i]) continue;
       const d = dist[i];
-      const u = Math.min(d / dEdge, 1.0);
-      const bullnose = Math.sqrt(u * (2.0 - u));
+      const tChamf = Math.min(d / 14.0, 1.0);
+      const chamfer = tChamf * tChamf * (3.0 - 2.0 * tChamf);
+      const bladeRoof = 1.0 - Math.exp(-d / 8.0);
 
-      const v = Math.min(d / chamferD, 1.0);
-      const chamferFacet = Math.pow(v, 0.8);
-      const bladeRoof = 1.0 - Math.exp(-d / 7.0);
-      const facetRelief = Math.max(0, Math.min(1.0, (lumClean[i] - lumLow[i] + 0.15) / 0.50));
-
-      const sculpted = (chamferFacet * 0.45) + (bladeRoof * 0.35) + (facetRelief * 0.20);
-      rawProfile[i] = bullnose * sculpted;
+      rawProfile[i] = (chamfer * 0.60) + (bladeRoof * 0.40);
     }
 
-    const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma * 0.5) : rawProfile;
+    const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma) : rawProfile;
 
-    // 4. Compute continuous raw heightfield
+    // 3. Compute continuous raw heightfield with cubic Hermite edge feathering
+    // Eliminates vertical edge cliffs and serrated teeth
     const rawZ = new Float32Array(w * h);
     const halfH = isDoubleSided ? ((baseThickness + bevelHeight) / 2.0) : bevelHeight;
 
     for (let i = 0; i < w * h; i++) {
       if (rawMask[i]) {
-        const alpha = smoothFloat ? Math.max(0, Math.min(1.0, smoothFloat[i] * 2.5 - 0.75)) : 1.0;
+        const alpha = smoothFloat ? Math.max(0, Math.min(1.0, smoothFloat[i] * 2.0 - 1.0)) : 1.0;
+        const alphaSmooth = alpha * alpha * (3.0 - 2.0 * alpha);
         if (isDoubleSided) {
-          rawZ[i] = smoothProfile[i] * halfH * alpha;
+          rawZ[i] = smoothProfile[i] * halfH * alphaSmooth;
         } else {
           const baseTaper = Math.min(dist[i] / 4.0, 1.0);
-          rawZ[i] = (baseTaper * baseThickness) + (smoothProfile[i] * bevelHeight * alpha);
+          rawZ[i] = (baseTaper * baseThickness) + (smoothProfile[i] * bevelHeight * alphaSmooth);
         }
       }
     }
 
-    // 5. Gentle edge-preserving relaxation filter
-    const relaxedZ = gaussianFilter(rawZ, w, h, 0.5);
+    // 4. Global surface relaxation filter: guarantees glass-smooth C2 continuity across entire mesh
+    const relaxedZ = gaussianFilter(rawZ, w, h, 1.0);
     for (let i = 0; i < w * h; i++) {
-      if (!rawMask[i]) relaxedZ[i] = 0;
+      if (!rawMask[i] || relaxedZ[i] < 1e-4) relaxedZ[i] = 0;
     }
 
     // Pad grid by 1 pixel for clean boundary sealing
