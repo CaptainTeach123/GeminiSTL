@@ -429,10 +429,12 @@ function getMaskFromImage(img, maxSize) {
 
   let finalMask = rawMask;
   if (mode === "tribal") {
-    // 1. Filter out corner vignette & isolated debris on raw mask (NO dilation, zero bloat!)
+    // 1. Filter out corner vignette & isolated debris on raw mask
     const filtered = filterConnectedComponents(rawMask, w, h, data);
-    // 2. Fill small internal reflection voids while preserving genuine tribal cutouts
-    finalMask = fillSmallHoles(filtered, w, h, 200);
+    // 2. Heal small internal reflection voids while keeping genuine cutouts open
+    const filled = fillSmallHoles(filtered, w, h, 250);
+    // 3. 1-pass gentle closing to heal 1-2px edge reflection notches (net expansion = 0px)
+    finalMask = binaryClosing(filled, w, h, 1);
   }
 
   return { w, h, mask: finalMask, canvas };
@@ -476,31 +478,34 @@ function build3DModel() {
     const bevelHeight = parseFloat(dom.bevelHeight.value);
     const sigma = parseFloat(dom.smoothingSigma.value);
 
-    const { w, h, mask: rawMask } = getMaskFromImage(state.image, maxSize);
+    const { w, h, mask: rawMask, canvas } = getMaskFromImage(state.image, maxSize);
+    const ctx = canvas.getContext("2d");
+    const imgData = ctx.getImageData(0, 0, w, h).data;
 
     // Compute exact Euclidean Distance Transform
     const dist = distanceTransform(rawMask, w, h);
 
-    // Precision Chiseled Tribal Blade Profile:
-    // Replaces bloated dome curvature with steep 45-degree edge chamfers (6px)
-    // and linear planar facets rising to the central ridge spine.
     let maxDist = 0;
     for (let i = 0; i < w * h; i++) {
       if (dist[i] > maxDist) maxDist = dist[i];
     }
     maxDist += 1e-5;
 
-    const chamferW = 6.0;
-    const chiseledProfile = new Float32Array(w * h);
+    // Continuous tapered sculpted profile: aerodynamic blade taper + surface chrome shading detail
+    const rawProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
-      const chamfer = Math.min(dist[i] / chamferW, 1.0);
-      const ridge = dist[i] / maxDist;
-      chiseledProfile[i] = chamfer * 0.70 + ridge * 0.30;
+      if (!rawMask[i]) continue;
+      const normDist = dist[i] / maxDist;
+      const hornTaper = Math.pow(normDist, 0.85);
+
+      const p = i * 4;
+      const r = imgData[p], g = imgData[p + 1], b = imgData[p + 2];
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+
+      rawProfile[i] = (hornTaper * 0.75) + (lum * 0.25);
     }
 
-    // Subtle smoothing removes pixel raster aliasing while keeping ridges razor sharp
-    const effectiveSigma = Math.min(sigma, 0.4);
-    const smoothProfile = (effectiveSigma > 0.05) ? gaussianFilter(chiseledProfile, w, h, effectiveSigma) : chiseledProfile;
+    const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma) : rawProfile;
 
     // Pad grid by 1 pixel for clean boundary sealing
     const paddedW = w + 2;
@@ -514,7 +519,10 @@ function build3DModel() {
         const padIdx = (r + 1) * paddedW + (c + 1);
         if (rawMask[rawIdx]) {
           mask[padIdx] = 1;
-          Z[padIdx] = baseThickness + (smoothProfile[rawIdx] * bevelHeight);
+          // Smooth tapered base: ramps smoothly from 0 at boundary to baseThickness over 4 pixels
+          // Eliminates rough 90-degree vertical stair-step walls completely!
+          const baseTaper = Math.min(dist[rawIdx] / 4.0, 1.0);
+          Z[padIdx] = (baseTaper * baseThickness) + (smoothProfile[rawIdx] * bevelHeight);
         }
       }
     }

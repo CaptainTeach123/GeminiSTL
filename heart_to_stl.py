@@ -52,17 +52,21 @@ def create_heart_stl(
         if comp_lum > 30 and (comp_g > 10 or sizes[lbl] > 500):
             clean_mask |= (labeled == lbl)
             
-    # Smart internal void healing: seal small reflection crevices (< 600 px) inside the metal
-    # while keeping large genuine tribal negative cutouts (> 1000 px) 100% open (zero outer perimeter bloat!)
+    # Smart internal void healing: seal small reflection crevices (< 1200 px) inside the metal
+    # while keeping large genuine tribal negative cutouts (> 1500 px) 100% open
     all_filled = binary_fill_holes(clean_mask)
     holes = all_filled ^ clean_mask
     hole_labeled, hole_num = label(holes)
     hole_sizes = np.bincount(hole_labeled.ravel())
     
-    final_full_mask = clean_mask.copy()
+    filled_mask = clean_mask.copy()
     for h_lbl in range(1, hole_num + 1):
-        if hole_sizes[h_lbl] < 600:
-            final_full_mask |= (hole_labeled == h_lbl)
+        if hole_sizes[h_lbl] < 1200:
+            filled_mask |= (hole_labeled == h_lbl)
+            
+    # Gentle 1-pixel closing to seal microscopic edge reflection notches without net boundary expansion
+    struct = generate_binary_structure(2, 2)
+    final_full_mask = binary_closing(filled_mask, structure=struct, iterations=1)
             
     # 2. Resample clean mask to high-resolution grid
     aspect = final_full_mask.shape[0] / final_full_mask.shape[1]
@@ -73,21 +77,31 @@ def create_heart_stl(
     )
     mask_grid = np.array(mask_img) > 128
     
-    print(f"Generating chiseled 3D blade geometry on {target_w}x{target_h} grid...")
+    # Resample luminance for realistic chrome surface sculpting
+    img_src = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    arr_src = np.array(img_src, dtype=np.float32)
+    lum = (0.299 * arr_src[:,:,0] + 0.587 * arr_src[:,:,1] + 0.114 * arr_src[:,:,2]) / 255.0
+    lum_smooth = gaussian_filter(lum, sigma=1.0)
     
-    # 3. Precision Chiseled Tribal Blade Profile:
-    # Replaces bloated dome curvature with steep 45-degree edge chamfers (6px)
-    # and linear planar facets rising to the central ridge spine.
+    print(f"Generating tapered 3D sculpted geometry on {target_w}x{target_h} grid...")
+    
+    # 3. Precision Tapered Base & Sculpted Relief:
+    # Eliminates rough 90-degree vertical stair-step walls by tapering the base (4px draft angle)
+    # and tapers the horns dynamically from edge to crest, matching the example model.
     dist = distance_transform_edt(mask_grid)
     d_max = dist.max() + 1e-5
-    chamfer_w = 6.0
-    chamfer = np.clip(dist / chamfer_w, 0.0, 1.0)
-    ridge = dist / d_max
-    chiseled_profile = chamfer * 0.70 + ridge * 0.30
-    chiseled_profile = gaussian_filter(chiseled_profile, sigma=0.35)
+    norm_dist = dist / d_max
     
-    # Total Z height map
-    Z = np.where(mask_grid, base_thickness + (chiseled_profile * bevel_height), 0.0)
+    # Smooth tapered base: ramps smoothly from 0 at boundary to base_thickness over 4 pixels
+    base_taper = np.clip(dist / 4.0, 0.0, 1.0)
+    
+    # Continuous tapered sculpted profile: aerodynamic blade taper + surface shading detail
+    horn_taper = norm_dist ** 0.85
+    height_profile = (horn_taper * 0.75) + (lum_smooth * 0.25 * mask_grid)
+    height_profile = gaussian_filter(height_profile, sigma=0.8)
+    
+    # Total Z height map: tapered base + sculpted relief
+    Z = np.where(mask_grid, (base_taper * base_thickness) + (height_profile * bevel_height), 0.0)
     
     # Pad edges with zeros so side walls seal cleanly
     Z = np.pad(Z, pad_width=1, mode="constant", constant_values=0.0)
