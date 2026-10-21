@@ -68,45 +68,49 @@ def create_heart_stl(
         if h_sizes[i] < 120:
             filled_mask |= (lbl_h == i)
             
-    # 4. Continuous Level-Set contour field (sigma=2.5 for silky smooth CAD curves)
-    smooth_float = gaussian_filter(filled_mask.astype(np.float32), sigma=2.5)
+    # 4. Continuous Level-Set contour field
+    smooth_float = gaussian_filter(filled_mask.astype(np.float32), sigma=1.8)
     mask_grid = (smooth_float >= 0.5)
     
-    print(f"Generating {'double-sided' if double_sided else 'single-sided'} silky smooth 3D CAD geometry on {target_w}x{target_h} grid...")
+    print(f"Generating {'double-sided' if double_sided else 'single-sided'} seamless CAD geometry on {target_w}x{target_h} grid...")
     
-    # 5. Distance transform with Gaussian smoothing (eliminates Voronoi discrete grid ripples)
+    # 5. Continuous distance transform
     raw_dist = distance_transform_edt(mask_grid)
-    dist = gaussian_filter(raw_dist, sigma=2.0)
+    dist = gaussian_filter(raw_dist, sigma=1.0)
     d_max = dist.max() + 1e-5
     
-    # Smooth Hermite knife-edge feathering (zero slope at perimeter knife edge: zero edge cliff)
-    t = np.clip(dist / 5.0, 0.0, 1.0)
-    edge_feather = t * t * (3.0 - 2.0 * t)
+    # 6. Seamless Elliptical Bullnose Edge Rounding:
+    # Eliminates equatorial seam by matching vertical tangent (normal is purely horizontal at d=0)
+    d_edge = 3.0
+    u = np.clip(dist / d_edge, 0.0, 1.0)
+    bullnose = np.sqrt(u * (2.0 - u))
     
-    # Pure, noise-free CAD blade sculpting:
-    # 55% smooth 45-degree chamfer bevel + 40% aerodynamic blade roof + 5% subtle smooth tone
-    # ZERO photographic noise / ZERO orange-peel ripples
-    chamfer = np.clip(dist / 12.0, 0.0, 1.0)
-    chamfer = chamfer * chamfer * (3.0 - 2.0 * chamfer)
+    # 7. Refined Chiseled Blade Topography:
+    # 45-degree chamfer bevel rising to sharp blade ridge
+    chamfer_d = 12.0
+    v = np.clip(dist / chamfer_d, 0.0, 1.0)
+    chamfer_facet = v ** 0.8
+    blade_roof = 1.0 - np.exp(-dist / 7.0)
     
-    blade_roof = 1.0 - np.exp(-dist / 8.0)
+    # Clean medium-frequency chrome facet relief (bandpass filter: removes DC gradient & removes pixel noise)
+    lum_low = gaussian_filter(lum, sigma=12.0)
+    lum_clean = gaussian_filter(lum, sigma=1.5)
+    facet_relief = np.clip((lum_clean - lum_low + 0.15) / 0.50, 0.0, 1.0) * mask_grid
     
-    lum_clean = gaussian_filter(lum, sigma=4.0)
-    lum_relief = np.clip((lum_clean - 0.15) / 0.85, 0.0, 1.0) * mask_grid
-    
-    sculpted = (chamfer * 0.55) + (blade_roof * 0.40) + (lum_relief * 0.05)
+    # Composite: 45% chamfer + 35% blade roof + 20% refined facet relief
+    sculpted = (chamfer_facet * 0.45) + (blade_roof * 0.35) + (facet_relief * 0.20)
     
     half_h = (base_thickness + bevel_height) / 2.0 if double_sided else bevel_height
     alpha = np.clip(smooth_float * 2.5 - 0.75, 0.0, 1.0)
     
     if double_sided:
-        Z = np.where(mask_grid, edge_feather * sculpted * half_h * alpha, 0.0)
+        Z = np.where(mask_grid, bullnose * sculpted * half_h * alpha, 0.0)
     else:
         base_taper = np.clip(dist / 4.0, 0.0, 1.0)
         Z = np.where(mask_grid, (base_taper * base_thickness) + (sculpted * bevel_height * alpha), 0.0)
         
-    # Global surface relaxation filter: guarantees glass-smooth C2 continuity across entire mesh
-    Z = gaussian_filter(Z, sigma=1.2) * mask_grid
+    # Gentle edge-preserving surface relaxation filter
+    Z = gaussian_filter(Z, sigma=0.5) * mask_grid
     
     # Pad edges with zeros so geometry closes cleanly
     Z = np.pad(Z, pad_width=1, mode="constant", constant_values=0.0)
@@ -116,7 +120,7 @@ def create_heart_stl(
     scale = width_mm / W
     
     faces = []
-    print("Building watertight 3D solid mesh with silky smooth CAD surface...")
+    print("Building watertight 3D solid mesh with seamless bullnose edges...")
     
     for r in range(H - 1):
         for c in range(W - 1):
