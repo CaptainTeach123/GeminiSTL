@@ -86,6 +86,14 @@
         <h2 class="card-title">2. 3D Print Geometry</h2>
         
         <div class="control-group">
+          <label for="modelStyle">Model Style</label>
+          <select id="modelStyle" class="form-select">
+            <option value="double" selected>Double-Sided (Identical Beveled Top &amp; Bottom)</option>
+            <option value="single">Single-Sided (Flat Base Relief)</option>
+          </select>
+        </div>
+
+        <div class="control-group">
           <div class="control-label">
             <label for="widthMm">Physical Width</label>
             <span class="value-display" id="widthMmVal">120 mm</span>
@@ -121,9 +129,9 @@
         <div class="control-group">
           <div class="control-label">
             <label for="smoothingSigma">Edge Smoothing (Sigma)</label>
-            <span class="value-display" id="smoothingSigmaVal">0.8</span>
+            <span class="value-display" id="smoothingSigmaVal">0.4</span>
           </div>
-          <input type="range" id="smoothingSigma" min="0.0" max="2.0" step="0.1" value="0.8">
+          <input type="range" id="smoothingSigma" min="0.0" max="2.0" step="0.1" value="0.4">
         </div>
       </section>
 

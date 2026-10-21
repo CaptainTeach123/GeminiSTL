@@ -243,6 +243,7 @@ const dom = {
   loadPresetBtn: document.getElementById("loadPresetBtn"),
   sourcePreview: document.getElementById("sourcePreview"),
   maskCanvas: document.getElementById("maskCanvas"),
+  modelStyle: document.getElementById("modelStyle"),
   widthMm: document.getElementById("widthMm"),
   widthMmVal: document.getElementById("widthMmVal"),
   baseThickness: document.getElementById("baseThickness"),
@@ -342,12 +343,12 @@ function animate() {
 
 function getActiveMaterial() {
   const matConfig = {
-    studio: { color: 0xe2e8f0, metalness: 0.15, roughness: 0.35 },
-    chrome: { color: 0xdde3ea, metalness: 0.85, roughness: 0.2 },
-    pink: { color: 0xec4899, metalness: 0.1, roughness: 0.35 },
-    cyan: { color: 0x06b6d4, metalness: 0.2, roughness: 0.35 },
+    studio: { color: 0xf1f5f9, metalness: 0.35, roughness: 0.22 },
+    chrome: { color: 0xdde3ea, metalness: 0.88, roughness: 0.16 },
+    pink: { color: 0xec4899, metalness: 0.15, roughness: 0.3 },
+    cyan: { color: 0x06b6d4, metalness: 0.25, roughness: 0.3 },
     gold: { color: 0xf59e0b, metalness: 0.85, roughness: 0.2 },
-    clay: { color: 0xa8a29e, metalness: 0.0, roughness: 0.85 }
+    clay: { color: 0xa8a29e, metalness: 0.05, roughness: 0.7 }
   };
   const cfg = matConfig[currentMaterialMode] || matConfig.studio;
   return new THREE.MeshStandardMaterial({
@@ -432,9 +433,9 @@ function getMaskFromImage(img, maxSize) {
     // 1. Filter out corner vignette & isolated debris on raw mask
     const filtered = filterConnectedComponents(rawMask, w, h, data);
     // 2. Heal small internal reflection voids while keeping genuine cutouts open
-    const filled = fillSmallHoles(filtered, w, h, 250);
-    // 3. 1-pass gentle closing to heal 1-2px edge reflection notches (net expansion = 0px)
-    finalMask = binaryClosing(filled, w, h, 1);
+    const filled = fillSmallHoles(filtered, w, h, 400);
+    // 3. 3-pass gentle closing to heal edge reflection notches completely (0 random gaps in topography)
+    finalMask = binaryClosing(filled, w, h, 3);
   }
 
   return { w, h, mask: finalMask, canvas };
@@ -473,6 +474,7 @@ function build3DModel() {
 
   setTimeout(() => {
     const maxSize = parseInt(dom.maxResolution.value, 10);
+    const isDoubleSided = !dom.modelStyle || dom.modelStyle.value === "double";
     const widthMm = parseFloat(dom.widthMm.value);
     const baseThickness = parseFloat(dom.baseThickness.value);
     const bevelHeight = parseFloat(dom.bevelHeight.value);
@@ -491,18 +493,20 @@ function build3DModel() {
     }
     maxDist += 1e-5;
 
-    // Continuous tapered sculpted profile: aerodynamic blade taper + surface chrome shading detail
+    // Precision Sculpted Blade Profile:
+    // 45-degree chamfer bevel (12px) + aerodynamic blade spine + rich metallic chrome relief
     const rawProfile = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       if (!rawMask[i]) continue;
-      const normDist = dist[i] / maxDist;
-      const hornTaper = Math.pow(normDist, 0.85);
+      const chamfer = Math.min(dist[i] / 12.0, 1.0);
+      const spine = Math.pow(dist[i] / maxDist, 0.6);
 
       const p = i * 4;
       const r = imgData[p], g = imgData[p + 1], b = imgData[p + 2];
       const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+      const lumRelief = Math.max(0, Math.min(1.0, (lum - 0.15) / 0.85));
 
-      rawProfile[i] = (hornTaper * 0.75) + (lum * 0.25);
+      rawProfile[i] = (chamfer * 0.35) + (spine * 0.25) + (lumRelief * 0.40);
     }
 
     const smoothProfile = (sigma > 0) ? gaussianFilter(rawProfile, w, h, sigma) : rawProfile;
@@ -513,16 +517,22 @@ function build3DModel() {
     const Z = new Float32Array(paddedW * paddedH);
     const mask = new Uint8Array(paddedW * paddedH);
 
+    const halfH = isDoubleSided ? ((baseThickness + bevelHeight) / 2.0) : bevelHeight;
+
     for (let r = 0; r < h; r++) {
       for (let c = 0; c < w; c++) {
         const rawIdx = r * w + c;
         const padIdx = (r + 1) * paddedW + (c + 1);
         if (rawMask[rawIdx]) {
           mask[padIdx] = 1;
-          // Smooth tapered base: ramps smoothly from 0 at boundary to baseThickness over 4 pixels
-          // Eliminates rough 90-degree vertical stair-step walls completely!
-          const baseTaper = Math.min(dist[rawIdx] / 4.0, 1.0);
-          Z[padIdx] = (baseTaper * baseThickness) + (smoothProfile[rawIdx] * bevelHeight);
+          const d = dist[rawIdx];
+          const edgeFeather = Math.min(d / 2.0, 1.0);
+          if (isDoubleSided) {
+            Z[padIdx] = edgeFeather * smoothProfile[rawIdx] * halfH;
+          } else {
+            const baseTaper = Math.min(d / 4.0, 1.0);
+            Z[padIdx] = (baseTaper * baseThickness) + (smoothProfile[rawIdx] * bevelHeight);
+          }
         }
       }
     }
@@ -541,16 +551,44 @@ function build3DModel() {
         const p01 = (r + 1) * paddedW + c;
         const p11 = (r + 1) * paddedW + (c + 1);
 
-        if (mask[p00] || mask[p10] || mask[p01] || mask[p11]) {
-          const x0 = c * scale;
-          const x1 = (c + 1) * scale;
-          const y0 = (paddedH - r) * scale;
-          const y1 = (paddedH - (r + 1)) * scale;
+        const z00 = Z[p00], z10 = Z[p10];
+        const z01 = Z[p01], z11 = Z[p11];
 
-          const z00 = Z[p00], z10 = Z[p10];
-          const z01 = Z[p01], z11 = Z[p11];
+        // If all 4 corners are 0, skip
+        if (z00 === 0 && z10 === 0 && z01 === 0 && z11 === 0) continue;
 
-          // Top sculpted surface
+        const x0 = c * scale;
+        const x1 = (c + 1) * scale;
+        const y0 = (paddedH - r) * scale;
+        const y1 = (paddedH - (r + 1)) * scale;
+
+        if (isDoubleSided) {
+          // Adaptive diagonal split to avoid diagonal saddle line through zero
+          if ((z01 === 0 && z10 === 0 && (z00 > 0 || z11 > 0)) || Math.abs(z00 - z11) < Math.abs(z01 - z10)) {
+            // Tri 1: (00, 01, 11)
+            if (!(z00 === 0 && z01 === 0 && z11 === 0)) {
+              addTri(x0, y0, z00,   x0, y1, z01,   x1, y1, z11);
+              addTri(x0, y0, -z00,  x1, y1, -z11,  x0, y1, -z01);
+            }
+            // Tri 2: (00, 11, 10)
+            if (!(z00 === 0 && z11 === 0 && z10 === 0)) {
+              addTri(x0, y0, z00,   x1, y1, z11,   x1, y0, z10);
+              addTri(x0, y0, -z00,  x1, y0, -z10,  x1, y1, -z11);
+            }
+          } else {
+            // Tri 1: (00, 01, 10)
+            if (!(z00 === 0 && z01 === 0 && z10 === 0)) {
+              addTri(x0, y0, z00,   x0, y1, z01,   x1, y0, z10);
+              addTri(x0, y0, -z00,  x1, y0, -z10,  x0, y1, -z01);
+            }
+            // Tri 2: (10, 01, 11)
+            if (!(z10 === 0 && z01 === 0 && z11 === 0)) {
+              addTri(x1, y0, z10,   x0, y1, z01,   x1, y1, z11);
+              addTri(x1, y0, -z10,  x1, y1, -z11,  x0, y1, -z01);
+            }
+          }
+        } else {
+          // Top sculpted surface (+Z)
           addTri(x0, y0, z00,  x0, y1, z01,  x1, y0, z10);
           addTri(x1, y0, z10,  x0, y1, z01,  x1, y1, z11);
 
@@ -558,26 +596,26 @@ function build3DModel() {
           addTri(x0, y0, 0,  x1, y0, 0,  x0, y1, 0);
           addTri(x1, y0, 0,  x1, y1, 0,  x0, y1, 0);
 
-          // Watertight vertical boundary walls
-          if (r === 0 || !mask[(r - 1) * paddedW + c]) {
-            addTri(x0, y0, 0,  x0, y0, z00,  x1, y0, z10);
-            addTri(x0, y0, 0,  x1, y0, z10,  x1, y0, 0);
-          }
-          if (r === paddedH - 2 || !mask[(r + 1) * paddedW + c]) {
-            addTri(x0, y1, 0,  x1, y1, z11,  x0, y1, z01);
-            addTri(x0, y1, 0,  x1, y1, 0,    x1, y1, z11);
-          }
-          if (c === 0 || !mask[r * paddedW + (c - 1)]) {
-            addTri(x0, y0, 0,  x0, y1, z01,  x0, y0, z00);
-            addTri(x0, y0, 0,  x0, y1, 0,    x0, y1, z01);
-          }
-          if (c === paddedW - 2 || !mask[r * paddedW + (c + 1)]) {
-            addTri(x1, y0, 0,  x1, y0, z10,  x1, y1, z11);
-            addTri(x1, y0, 0,  x1, y1, z11,  x1, y1, 0);
+            // Watertight vertical boundary walls (single-sided mode)
+            if (r === 0 || !mask[(r - 1) * paddedW + c]) {
+              addTri(x0, y0, 0,  x0, y0, z00,  x1, y0, z10);
+              addTri(x0, y0, 0,  x1, y0, z10,  x1, y0, 0);
+            }
+            if (r === paddedH - 2 || !mask[(r + 1) * paddedW + c]) {
+              addTri(x0, y1, 0,  x1, y1, z11,  x0, y1, z01);
+              addTri(x0, y1, 0,  x1, y1, 0,    x1, y1, z11);
+            }
+            if (c === 0 || !mask[r * paddedW + (c - 1)]) {
+              addTri(x0, y0, 0,  x0, y1, z01,  x0, y0, z00);
+              addTri(x0, y0, 0,  x0, y1, 0,    x0, y1, z01);
+            }
+            if (c === paddedW - 2 || !mask[r * paddedW + (c + 1)]) {
+              addTri(x1, y0, 0,  x1, y0, z10,  x1, y1, z11);
+              addTri(x1, y0, 0,  x1, y1, z11,  x1, y1, 0);
+            }
           }
         }
       }
-    }
 
     const vertexFloatArray = new Float32Array(vertices);
     const numTriangles = vertices.length / 9;
